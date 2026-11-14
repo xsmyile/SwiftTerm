@@ -1606,9 +1606,18 @@ final class MetalTerminalRenderer {
         if capturesRenderedTexture {
             lastRenderedTexture = drawable.texture
         }
-        commandBuffer.present(drawable)
         bufferPool.commit(commandBuffer: commandBuffer)
-        commandBuffer.commit()
+        if drawableFrame.presentsWithTransaction {
+            // CAMetalLayer.presentsWithTransaction: commit, wait until
+            // scheduled, then present, so the drawable joins the current
+            // Core Animation transaction.
+            commandBuffer.commit()
+            commandBuffer.waitUntilScheduled()
+            drawable.present()
+        } else {
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
+        }
         if waitForCompletionAfterCommit {
             // Testing only: makes the drawable texture readable right after
             // render() returns, so a test can compare what two surfaces

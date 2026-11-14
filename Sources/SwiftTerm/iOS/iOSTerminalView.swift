@@ -2344,6 +2344,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 #if canImport(MetalKit)
         if useMetalRenderer, let metalView = metalView {
             metalView.frame = bounds
+            if sizeChanged, let layerView = metalView as? TerminalMetalLayerView {
+                presentResizedFrame(layerView)
+            }
             frameDriver.markDirty()
         } else {
 	    if sizeChanged || originChanged {
@@ -2358,6 +2361,39 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
         lastLayoutBounds = currentBounds
     }
+
+#if canImport(MetalKit)
+    /// Draws the resized layer surface inside the layout's Core Animation
+    /// transaction.
+    ///
+    /// The layer takes its new bounds in this transaction. A frame drawn on
+    /// the render loop instead is presented outside it: until it lands, the
+    /// previous drawable is shown scaled to the new bounds, and during a
+    /// rotation the system holds the transition for it, so the text stays
+    /// stretched for an instant before the rotation moves. The host
+    /// callbacks the frame implies, such as `sizeChanged`, run on a later
+    /// main-actor turn, not inside layout.
+    private func presentResizedFrame(_ surface: TerminalMetalLayerView) {
+        surface.layoutIfNeeded()
+        withRenderLoopSuspended {
+            guard let viewState = captureFrameViewState() else { return }
+            let prepared = prepareFrame(viewState: viewState)
+            if prepared == nil {
+                guard refreshSnapshotForMetal() else { return }
+            }
+            surface.setPresentsWithTransaction(true)
+            renderOwner.renderMetal()
+            surface.setPresentsWithTransaction(false)
+            renderOwner.discardPreparedMetalSnapshot()
+            guard let prepared else { return }
+            updateCursorPosition(from: prepared.cursor, rowCount: prepared.cursorRowCount)
+            let effects = prepared.mainEffects
+            Task { @MainActor [weak self] in
+                self?.applyFrameSideEffects(effects)
+            }
+        }
+    }
+#endif
 
     open override var contentOffset: CGPoint {
         didSet {

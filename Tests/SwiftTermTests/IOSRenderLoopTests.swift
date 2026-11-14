@@ -194,6 +194,43 @@ struct IOSRenderLoopTests {
         #expect(spinMainThread { (view.renderLoop?.currentCounters.frames ?? 0) > 0 })
     }
 
+    /// A resize reaches the screen with a drawable of the new size in the
+    /// layout's Core Animation transaction. Drawn on the render loop instead,
+    /// it is presented outside that transaction: the previous drawable is
+    /// shown stretched to the new bounds, and a rotation waits for it.
+    @Test(.enabled(if: IOSRenderLoopTests.metalIsUsable))
+    func aResizeDrawsTheNewSizeDuringLayout() throws {
+        let (window, view) = makeWindowedView()
+        defer { close(view, window) }
+        try view.setUseMetal(true)
+        let surface = try #require(view.metalView as? TerminalMetalLayerView)
+        view.layoutIfNeeded()
+        let rendersBefore = view.renderOwner.completedMetalRenders
+
+        view.frame.size = CGSize(width: 300, height: 390)
+        view.layoutIfNeeded()
+
+        #expect(view.renderOwner.completedMetalRenders == rendersBefore + 1)
+        #expect(surface.bounds.size == view.bounds.size)
+        #expect(surface.renderDrawableSize ==
+                CGSize(width: 300 * surface.renderContentsScale, height: 390 * surface.renderContentsScale))
+        #expect(surface.metalLayer.presentsWithTransaction == false)
+    }
+
+    @Test(.enabled(if: IOSRenderLoopTests.metalIsUsable))
+    func aLayoutWithoutResizeLeavesTheFrameToTheLoop() throws {
+        let (window, view) = makeWindowedView()
+        defer { close(view, window) }
+        try view.setUseMetal(true)
+        view.layoutIfNeeded()
+        let rendersBefore = view.renderOwner.completedMetalRenders
+
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
+
+        #expect(view.renderOwner.completedMetalRenders == rendersBefore)
+    }
+
     /// A rotation or the keyboard resizes the layer without changing its
     /// scale, and the drawable has to follow, at the scale the host draws at.
     @Test func layerDrawableFollowsResizeAtTheHostScale() {

@@ -4366,6 +4366,18 @@ extension TerminalView {
         loop.start()
     }
 
+    /// Runs `body` on the main thread with no frame in flight.
+    ///
+    /// Use it for anything structural: replacing the surface, tearing the
+    /// renderer down, drawing a frame synchronously. Must not be called while
+    /// holding the terminal lock — see `RenderLoop.frameLock`.
+    func withRenderLoopSuspended<T> (_ body: () -> T) -> T {
+        guard let renderLoop, renderLoop.isRunning else { return body() }
+        renderLoop.frameLock.lock()
+        defer { renderLoop.frameLock.unlock() }
+        return body()
+    }
+
     func stopRenderLoop () {
         viewStateLock.lock()
         let loop = renderLoopStorage

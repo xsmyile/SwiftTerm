@@ -39,6 +39,10 @@ struct MetalDrawableFrame {
     let drawable: any CAMetalDrawable
     let renderPassDescriptor: MTLRenderPassDescriptor
     let geometry: MetalSurfaceGeometry
+    /// True when the drawable must join the current Core Animation
+    /// transaction: the renderer presents it from the calling thread once its
+    /// command buffer is scheduled, instead of from the GPU timeline.
+    var presentsWithTransaction = false
 }
 
 /// The part of a surface that the render thread can use.
