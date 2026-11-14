@@ -203,6 +203,100 @@ struct RenderClockTests {
         #expect(order == ["update", "tick"])
     }
 
+    /// A program that ends synchronized output on every frame sends a view
+    /// update per frame. While the clock's link runs they wait for its tick,
+    /// and one tick posts one main-actor task for all of them, as the main
+    /// link's tick did.
+    /// After main publishes a change, its frame is drawn at once unless one
+    /// was already drawn since the last tick: one tick and at most one such
+    /// frame per display period.
+    @Test func framesMainAsksForDrawSoonButOncePerTick() {
+        let (clock, source, loop, frames) = makeClock()
+        defer { clock.invalidate(); loop.invalidate() }
+        clock.requestFrame()
+        #expect(waitUntil { frames.value == 1 })
+
+        clock.requestFrame(soon: true)
+        usleep(20_000)
+        #expect(frames.value == 1)
+
+        source.tick()
+        #expect(waitUntil { frames.value == 2 })
+        clock.requestFrame(soon: true)
+        clock.requestFrame(soon: true)
+        usleep(20_000)
+        #expect(frames.value == 2)
+
+        source.tick()
+        #expect(waitUntil { frames.value == 3 })
+        source.tick()
+        clock.requestFrame(soon: true)
+        #expect(waitUntil { frames.value == 4 })
+        clock.requestFrame(soon: true)
+        usleep(20_000)
+        #expect(frames.value == 4)
+    }
+
+    @Test func viewUpdatesWaitForTheClockTick() async {
+        let driver = FrameDriver(tickSource: ManualTickSource())
+        var updates = 0
+        driver.onViewUpdate = { updates += 1 }
+        driver.onTick = {}
+        let (clock, source, loop, _) = makeClock()
+        defer { clock.invalidate(); loop.invalidate(); driver.invalidate() }
+        driver.attachRenderClock(clock)
+        clock.requestFrame()
+        #expect(source.isRunning)
+        driver.resetCounters()
+
+        let signal = driver.signal
+        await Task.detached {
+            for _ in 0..<200 { signal.requestViewUpdate() }
+        }.value
+        await drainMainQueue()
+        #expect(driver.currentCounters.deliveries == 0)
+        #expect(updates == 0)
+
+        source.tick()
+        await drainMainQueue()
+        #expect(driver.currentCounters.deliveries == 1)
+        #expect(updates == 1)
+
+        source.tick()
+        await drainMainQueue()
+        #expect(driver.currentCounters.deliveries == 1)
+    }
+
+    /// A view update waiting for a tick is delivered when the link stops
+    /// instead, so it is never stranded.
+    @Test func waitingViewUpdatesAreDeliveredWhenTheClockStops() async {
+        let driver = FrameDriver(tickSource: ManualTickSource())
+        var updates = 0
+        driver.onViewUpdate = { updates += 1 }
+        driver.onTick = {}
+        let (clock, source, loop, _) = makeClock()
+        defer { clock.invalidate(); loop.invalidate(); driver.invalidate() }
+        driver.attachRenderClock(clock)
+        clock.requestFrame()
+
+        let signal = driver.signal
+        await Task.detached { signal.requestViewUpdate() }.value
+        await drainMainQueue()
+        #expect(updates == 0)
+
+        driver.setVisibilityOnMain(visible: false)
+        await drainMainQueue()
+        #expect(!source.isRunning)
+        #expect(updates == 1)
+
+        driver.setVisibilityOnMain(visible: true)
+        clock.requestFrame()
+        await Task.detached { signal.requestViewUpdate() }.value
+        for _ in 0..<RenderClock.idleTickLimit { source.tick() }
+        await drainMainQueue()
+        #expect(updates == 2)
+    }
+
     @Test func visibilitySuspendsTheClock() async {
         let tickSource = ManualTickSource()
         let driver = FrameDriver(tickSource: tickSource)
@@ -290,6 +384,16 @@ struct RenderClockTests {
         return (window, view)
     }
 
+    /// Lets a change made on main reach the published view state: it waits
+    /// for a clock tick, and some setters mark the frame from a later main
+    /// turn.
+    private func settle(_ source: ManualRenderClockSource) async {
+        for _ in 0..<2 {
+            source.tick()
+            await drainMainQueue()
+        }
+    }
+
     /// Swaps the view's clock for one driven by hand: a window that is never
     /// ordered in gets no display-link ticks.
     private func useManualClock(_ view: TerminalView) throws -> ManualRenderClockSource {
@@ -358,6 +462,101 @@ struct RenderClockTests {
         #expect(drawnWhileBusy >= 10)
     }
 
+    private struct CapturedSetter {
+        let name: String
+        let set: @MainActor (TerminalView) -> Void
+        let read: (FrameViewState) -> String
+    }
+
+    /// Every setter of an input the frame captures, with the published value
+    /// it must change. With a render clock nothing on main captures the view
+    /// state per frame, so a setter that forgot its dirty mark would only be
+    /// drawn after some unrelated change on main.
+    private static let capturedSetters: [CapturedSetter] = [
+        CapturedSetter(name: "caretColor", set: { $0.caretColor = .systemPink },
+                       read: { "\($0.caretColor)" }),
+        CapturedSetter(name: "caretTextColor", set: { $0.caretTextColor = .systemTeal },
+                       read: { "\($0.caretTextColor)" }),
+        CapturedSetter(name: "metalBufferingMode", set: { $0.metalBufferingMode = .perFrameAggregated },
+                       read: { "\($0.metalBufferingMode)" }),
+        CapturedSetter(name: "fontSmoothing", set: { $0.fontSmoothing.toggle() },
+                       read: { "\($0.fontSmoothing)" }),
+        CapturedSetter(name: "notifyUpdateChanges", set: { $0.notifyUpdateChanges.toggle() },
+                       read: { "\($0.notifyUpdateChanges)" }),
+        CapturedSetter(name: "nativeForegroundColor", set: { $0.nativeForegroundColor = .systemOrange },
+                       read: { "\($0.effectiveForegroundColor)" }),
+        CapturedSetter(name: "nativeBackgroundColor", set: { $0.nativeBackgroundColor = .systemIndigo },
+                       read: { "\($0.effectiveBackgroundColor)" }),
+        CapturedSetter(name: "selectedTextBackgroundColor", set: { $0.selectedTextBackgroundColor = .systemBrown },
+                       read: { "\($0.selectedTextBackgroundColor)" }),
+        CapturedSetter(name: "selectedTextForegroundColor", set: { $0.selectedTextForegroundColor = .systemMint },
+                       read: { "\($0.selectedTextForegroundColor)" }),
+        CapturedSetter(name: "linkColor", set: { $0.linkColor = .systemGreen },
+                       read: { "\(String(describing: $0.linkColor as Any))" }),
+        CapturedSetter(name: "linkUnderlineColor", set: { $0.linkUnderlineColor = .systemRed },
+                       read: { "\(String(describing: $0.linkUnderlineColor as Any))" }),
+        CapturedSetter(name: "linkHighlightMode", set: { $0.linkHighlightMode = .always },
+                       read: { "\($0.linkHighlightMode)" }),
+        CapturedSetter(name: "commandActive", set: { $0.commandActive.toggle() },
+                       read: { "\($0.commandActive)" }),
+        CapturedSetter(name: "linkHighlightRange",
+                       set: { $0.linkHighlightRange = [.init(row: 0, range: 0..<4)] },
+                       read: { "\($0.linkHighlightRange as Any)" }),
+        CapturedSetter(name: "textBlinkVisible", set: { $0.textBlinkVisible.toggle() },
+                       read: { "\($0.textBlinkVisible)" }),
+        CapturedSetter(name: "antiAliasCustomBlockGlyphs", set: { $0.antiAliasCustomBlockGlyphs.toggle() },
+                       read: { "\($0.antiAliasCustomBlockGlyphs)" }),
+        CapturedSetter(name: "customBlockGlyphs", set: { $0.customBlockGlyphs.toggle() },
+                       read: { "\($0.customBlockGlyphs)" }),
+        CapturedSetter(name: "useBrightColors", set: { $0.useBrightColors.toggle() },
+                       read: { "\($0.useBrightColors)" }),
+        CapturedSetter(name: "collapseBrightColorsToBase", set: { $0.collapseBrightColorsToBase.toggle() },
+                       read: { "\($0.collapseBrightColorsToBase)" }),
+        CapturedSetter(name: "minimumContrastRatio", set: { $0.minimumContrastRatio = 4.5 },
+                       read: { "\($0.minimumContrastRatio)" }),
+        CapturedSetter(name: "translucentCellBackgrounds", set: { $0.translucentCellBackgrounds.toggle() },
+                       read: { "\($0.translucentCellBackgrounds)" }),
+        CapturedSetter(name: "bidiHostPolicy", set: { $0.bidiHostPolicy = .legacyLeftToRight },
+                       read: { "\($0.bidiHostPolicy)" }),
+        CapturedSetter(name: "caretViewTracksFocus", set: { $0.caretViewTracksFocus.toggle() },
+                       read: { "\($0.cursorHasFocus)" }),
+        CapturedSetter(name: "font", set: { $0.font = NSFont.monospacedSystemFont(ofSize: 19, weight: .regular) },
+                       read: { "\($0.cellDimension.width)x\($0.cellDimension.height)" }),
+        CapturedSetter(name: "metalScaleFactorOverride", set: { $0.metalScaleFactorOverride = 3 },
+                       read: { "\($0.renderingScale)" }),
+    ]
+
+    /// Each setter publishes its change for the next frame while only the
+    /// clock and background output drive frames.
+    @available(macOS 14.0, *)
+    @Test(.enabled(if: RenderClockTests.metalIsUsable),
+          arguments: 0..<25)
+    func capturedSettersReachTheNextFrame(index: Int) async throws {
+        #expect(Self.capturedSetters.count == 25)
+        let setter = Self.capturedSetters[index]
+        let (window, view) = makeWindowedView()
+        defer {
+            _ = view.updateUiClosed()
+            window.close()
+        }
+        try view.setUseMetal(true)
+        let source = try useManualClock(view)
+        await drainMainQueue()
+        let mailbox = view.renderOwner.mailbox
+        let before = setter.read(try #require(mailbox.publishedViewState))
+
+        setter.set(view)
+        await settle(source)
+        let sender = view.feedSender
+        await Task.detached {
+            sender.feed(text: "background output\r\n")
+            source.tick()
+        }.value
+
+        let after = setter.read(try #require(mailbox.publishedViewState))
+        #expect(after != before, "\(setter.name) did not reach the published view state")
+    }
+
     /// The rule the clock relies on: a visible change made on main marks the
     /// frame dirty, and that mark publishes the new view state before the
     /// frame that shows it. A setter that changed the view without marking
@@ -378,18 +577,17 @@ struct RenderClockTests {
         let before = try #require(mailbox.publishedViewState)
 
         view.font = NSFont.monospacedSystemFont(ofSize: 23, weight: .regular)
-        await drainMainQueue()
+        await settle(source)
         let afterFont = try #require(mailbox.publishedViewState)
         #expect(afterFont.cellDimension.height > before.cellDimension.height)
 
         view.nativeForegroundColor = NSColor(srgbRed: 0.9, green: 0.1, blue: 0.2, alpha: 1)
-        await drainMainQueue()
+        await settle(source)
         let afterColor = try #require(mailbox.publishedViewState)
         #expect(afterColor.effectiveForegroundColor != afterFont.effectiveForegroundColor)
 
         view.selectAll(nil)
-        await drainMainQueue()
-        source.tick()
+        await settle(source)
         #expect(waitUntil { view.renderOwner.inspection().selectionActive })
     }
 }

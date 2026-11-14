@@ -39,6 +39,16 @@ struct RenderClockCounters: Sendable {
     var immediateFrames = 0
 }
 
+/// What a render clock tells the main-thread side about its cadence.
+enum RenderClockCadence: Sendable {
+    /// The display link started: ticks are coming.
+    case started
+    /// One display tick.
+    case tick
+    /// The display link stopped: no tick is coming until a change starts it.
+    case stopped
+}
+
 /// Where a render clock's ticks come from.
 ///
 /// `start` and `stop` can be called from any thread and must not block. A
@@ -73,8 +83,11 @@ final class RenderClock: Sendable {
         var suspended = false
         var stopped = false
         var idleTicks = 0
+        /// A frame was drawn since the last tick.
+        var drewSinceTick = false
         var lastResumeNs: UInt64 = 0
         var counters = RenderClockCounters()
+        var cadenceObserver: (@Sendable (RenderClock, RenderClockCadence) -> Void)?
     }
 
     private let state = Locked(State())
@@ -94,13 +107,33 @@ final class RenderClock: Sendable {
         invalidate()
     }
 
+    /// Installs the callback that hears when the link starts, ticks and
+    /// stops. It runs inside the clock's lock, so it sees the events in
+    /// order; it must not call back into the clock.
+    func setCadenceObserver (_ observer: (@Sendable (RenderClock, RenderClockCadence) -> Void)?) {
+        state.withLock { $0.cadenceObserver = observer }
+    }
+
     /// Asks for a frame with the current terminal content and the last
     /// published view state. Safe from any thread.
-    func requestFrame () {
+    ///
+    /// `soon` is for the main thread after it published a new view state:
+    /// while the link runs, the frame is drawn at once if none was drawn
+    /// since the last tick, so a change made on main reaches the display at
+    /// the next tick, as it did when main's tick started every frame. A tick
+    /// and at most one such frame share a display period.
+    func requestFrame (soon: Bool = false) {
         let drawNow = state.withLock { state -> Bool in
             guard !state.stopped else { return false }
             state.dirty = true
-            guard !state.running, !state.suspended else { return false }
+            guard !state.suspended else { return false }
+            if state.running {
+                guard soon, !state.drewSinceTick else { return false }
+                state.dirty = false
+                state.drewSinceTick = true
+                state.counters.frames += 1
+                return true
+            }
             return resume(&state)
         }
         if drawNow {
@@ -118,6 +151,7 @@ final class RenderClock: Sendable {
                 if state.running {
                     state.running = false
                     source.stop()
+                    state.cadenceObserver?(self, .stopped)
                 }
                 return false
             }
@@ -136,6 +170,8 @@ final class RenderClock: Sendable {
             state.stopped = true
             state.running = false
             state.dirty = false
+            state.cadenceObserver?(self, .stopped)
+            state.cadenceObserver = nil
             return true
         }
         if stop {
@@ -165,6 +201,7 @@ final class RenderClock: Sendable {
         state.running = true
         state.idleTicks = 0
         source.start()
+        state.cadenceObserver?(self, .started)
         let now = nowNs()
         guard state.lastResumeNs == 0
                 || now &- state.lastResumeNs >= Self.minimumResumeInterval else {
@@ -172,6 +209,7 @@ final class RenderClock: Sendable {
         }
         state.lastResumeNs = now
         state.dirty = false
+        state.drewSinceTick = true
         state.counters.frames += 1
         state.counters.immediateFrames += 1
         return true
@@ -182,8 +220,11 @@ final class RenderClock: Sendable {
         let draw = state.withLock { state -> Bool in
             guard !state.stopped, state.running else { return false }
             state.counters.ticks += 1
+            state.drewSinceTick = false
+            state.cadenceObserver?(self, .tick)
             if state.dirty {
                 state.dirty = false
+                state.drewSinceTick = true
                 state.idleTicks = 0
                 state.counters.frames += 1
                 return true
@@ -195,6 +236,7 @@ final class RenderClock: Sendable {
                 state.running = false
                 state.counters.pauses += 1
                 source.stop()
+                state.cadenceObserver?(self, .stopped)
             }
             return false
         }

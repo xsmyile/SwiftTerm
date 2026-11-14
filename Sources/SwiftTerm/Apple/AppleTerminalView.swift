@@ -1644,7 +1644,10 @@ extension TerminalView {
     /// Defaults to `true` (standard macOS font smoothing).
     @objc open var fontSmoothing: Bool {
         get { _fontSmoothing }
-        set { _fontSmoothing = newValue }
+        set {
+            _fontSmoothing = newValue
+            frameDriver?.markDirty()
+        }
     }
 #endif
 
@@ -4166,7 +4169,7 @@ extension TerminalView {
         if usesRenderLoop {
             publishFrameViewState(viewState)
             if let clock = frameDriver.renderClock {
-                clock.requestFrame()
+                clock.requestFrame(soon: true)
             } else {
                 renderLoop?.signal()
             }

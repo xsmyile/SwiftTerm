@@ -193,7 +193,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     ///
     /// You can change this property at any time; the renderer picks up the
     /// new mode on the next frame.
-    public var metalBufferingMode: MetalBufferingMode = .perRowPersistent
+    public var metalBufferingMode: MetalBufferingMode = .perRowPersistent {
+        didSet { frameDriver?.markDirty() }
+    }
     
     /**
      * Whether mouse events are sent to the application running in the terminal once it has
@@ -260,7 +262,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
 
     private var lastReportedLink: String?
-    var commandActive = false
+    var commandActive = false {
+        didSet {
+            guard commandActive != oldValue else { return }
+            frameDriver?.markDirty()
+        }
+    }
     private var activeCommandKeys: Set<UIKeyboardHIDUsage> = []
     private var pointerInteraction: UIPointerInteraction?
     private var hoverGesture: UIHoverGestureRecognizer?
@@ -271,7 +278,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         case stopped
     }
     private var uiShutdownState = UIShutdownState.active
-    var linkHighlightRange: [Terminal.LinkMatch.RowRange]?
+    var linkHighlightRange: [Terminal.LinkMatch.RowRange]? {
+        didSet {
+            guard linkHighlightRange != oldValue else { return }
+            frameDriver?.markDirty()
+        }
+    }
     private var lastPointerLocation: CGPoint?
     
     /**
@@ -285,7 +297,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
      * If set to true, this will call the TerminalViewDelegate's rangeChanged method
      * when there are changes that are being performed on the UI
      */
-    public var notifyUpdateChanges = false
+    public var notifyUpdateChanges = false {
+        didSet { frameDriver?.markDirty() }
+    }
 
     /// If true, the caret view will show different shapes depending on the focus
     /// otherwise, it will behave like it is focused
@@ -323,7 +337,14 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     // effectiveNativeForegroundColor for why draw paths must not read the
     // terminal's flag directly. Access via reverseColorsActiveValue()/
     // setReverseColorsActive().
-    var textBlinkVisible = true
+    /// Captured by every frame, like every input of `FrameViewState`: a change
+    /// marks the frame dirty, which is how it reaches a frame drawn off main.
+    var textBlinkVisible = true {
+        didSet {
+            guard textBlinkVisible != oldValue else { return }
+            frameDriver?.markDirty()
+        }
+    }
     var textBlinkTimer: Timer?
     var textBlinkObservers: [(NotificationCenter, NSObjectProtocol)] = []
     var textBlinkApplicationActive = true
@@ -1866,6 +1887,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         set {
             cursorColorIsDefault = false
             caretView?.caretColor = newValue
+            frameDriver?.markDirty()
         }
     }
     
@@ -1876,6 +1898,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         set {
             cursorTextColorIsDefault = newValue == nil
             caretView?.caretTextColor = newValue
+            frameDriver?.markDirty()
         }
     }
 

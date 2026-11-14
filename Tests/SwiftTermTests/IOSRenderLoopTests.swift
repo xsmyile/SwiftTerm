@@ -232,6 +232,54 @@ struct IOSRenderLoopTests {
         #expect(view.renderOwner.completedMetalRenders == rendersBefore)
     }
 
+    /// Setters of inputs the frame captures that once relied on a later
+    /// main-thread tick to be picked up. With the render clock only a dirty
+    /// mark made on main publishes them, so each must reach the published
+    /// view state while only background output and the clock drive frames.
+    @Test(.enabled(if: IOSRenderLoopTests.metalIsUsable),
+          arguments: ["caretColor", "caretTextColor", "metalBufferingMode", "notifyUpdateChanges",
+                      "commandActive", "textBlinkVisible", "linkHighlightRange", "nativeForegroundColor"])
+    func capturedSettersReachTheNextFrame(name: String) async throws {
+        let (window, view) = makeWindowedView()
+        defer { close(view, window) }
+        try view.setUseMetal(true)
+        let loop = try #require(view.renderLoop)
+        let source = ManualRenderClockSource()
+        let old = view.frameDriver.renderClock
+        view.frameDriver.attachRenderClock(RenderClock(loop: loop, source: source))
+        old?.invalidate()
+        await drainMainQueue()
+        let read: (FrameViewState) -> String
+        switch name {
+        case "caretColor":
+            read = { "\($0.caretColor)" }; view.caretColor = .systemPink
+        case "caretTextColor":
+            read = { "\($0.caretTextColor)" }; view.caretTextColor = .systemTeal
+        case "metalBufferingMode":
+            read = { "\($0.metalBufferingMode)" }; view.metalBufferingMode = .perFrameAggregated
+        case "notifyUpdateChanges":
+            read = { "\($0.notifyUpdateChanges)" }; view.notifyUpdateChanges.toggle()
+        case "commandActive":
+            read = { "\($0.commandActive)" }; view.commandActive.toggle()
+        case "textBlinkVisible":
+            read = { "\($0.textBlinkVisible)" }; view.textBlinkVisible.toggle()
+        case "linkHighlightRange":
+            read = { "\($0.linkHighlightRange as Any)" }; view.linkHighlightRange = [.init(row: 0, range: 0..<4)]
+        default:
+            read = { "\($0.effectiveForegroundColor)" }; view.nativeForegroundColor = .systemOrange
+        }
+        await drainMainQueue()
+        let sender = view.feedSender
+        await Task.detached {
+            sender.feed(text: "background output\r\n")
+            source.tick()
+        }.value
+
+        let published = read(try #require(view.renderOwner.mailbox.publishedViewState))
+        #expect(published == read(FrameViewState(view: view)),
+                "\(name) did not reach the published view state")
+    }
+
     /// A rotation or the keyboard resizes the layer without changing its
     /// scale, and the drawable has to follow, at the scale the host draws at.
     @Test func layerDrawableFollowsResizeAtTheHostScale() {
