@@ -4871,6 +4871,46 @@ extension TerminalView {
     }
 
     /**
+     * Resizes the terminal to `cols` by `rows` before it returns, with a soft
+     * reset (DECSTR) only when `softReset` is `true`.
+     *
+     * `setFrameSize` during a live window resize queues the size for the
+     * next frame (`queueSizeChange`), so bytes fed meanwhile are parsed at the
+     * old grid. A host that shows another process's screen at that process's
+     * grid, and feeds the bytes drawn at it right after, needs the grid in
+     * place first, and keeps the modes and margins the program set, which a
+     * soft reset would drop. The size is queued as well, so a size a live
+     * resize queued before it does not undo it on the next frame.
+     */
+    public func resize (cols: Int, rows: Int, softReset: Bool)
+    {
+        let cellPixels = currentCellPixelSize()
+        var didResize = false
+        withTerminal { terminal in
+            if cols != terminal.cols || rows != terminal.rows {
+                selection.active = false
+                terminal.resize(
+                    cols: cols,
+                    rows: rows,
+                    cellWidth: cellPixels.width,
+                    cellHeight: cellPixels.height)
+                search.invalidate ()
+                didResize = true
+            }
+            if softReset {
+                terminal.softReset()
+            }
+        }
+        renderOwner.mailbox.queueSize(cols: cols, rows: rows)
+        if didResize {
+            accessibility.invalidate ()
+            terminalDelegate?.sizeChanged(source: self, newCols: cols, newRows: rows)
+            updateScroller()
+        }
+        frameDriver?.markDirty()
+    }
+
+    /**
      * Changes the scrollback size at runtime.
      *
      * - Parameter newScrollback: The new scrollback size in lines. Pass `nil` to disable scrollback.
