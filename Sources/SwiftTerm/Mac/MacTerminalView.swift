@@ -4195,7 +4195,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
     
-    public nonisolated func clipboardCopy(source: Terminal, content: Data) {
+    /// Called on the thread that parses the OSC 52 sequence, before the write
+    /// reaches `terminalDelegate` on the main actor. Open so a host can judge
+    /// the write by the bytes that asked for it, not by when it arrives.
+    nonisolated open func clipboardCopy(source: Terminal, content: Data) {
         let capturedContent = content
         onMain { [weak self] in
             guard let self else { return }
