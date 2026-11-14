@@ -73,6 +73,7 @@ struct IOSRenderLoopTests {
         #expect(view.usesMetalLayerSurface)
         #expect(view.metalView is TerminalMetalLayerView)
         #expect(view.isUsingRenderLoop)
+        #expect(view.frameDriver.renderClock != nil)
     }
 
     /// The frame tick on main only captures the view state and signals the

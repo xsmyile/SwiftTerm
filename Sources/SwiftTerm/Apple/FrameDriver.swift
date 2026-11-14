@@ -35,6 +35,9 @@ final class FrameDriverSignal: Sendable {
 
         /// Events that a running source's next tick can consume.
         static let deferrable: Events = [.dirty, .viewUpdate]
+
+        /// Events a render clock can draw without the main actor.
+        static let renderable: Events = [.dirty, .immediate]
     }
 
     typealias Sink = @MainActor @Sendable () -> Void
@@ -48,6 +51,9 @@ final class FrameDriverSignal: Sendable {
         var shutdownRequested = false
         var sinkConfigured = false
         var sink: Sink?
+        /// Set while a render clock draws the frames. A dirty mark from a
+        /// thread other than main then goes straight to it.
+        var renderClock: RenderClock?
     }
 
     private let state = Locked(State())
@@ -98,6 +104,9 @@ final class FrameDriverSignal: Sendable {
             guard !state.shutdownRequested else { return }
             state.shutdownRequested = true
             state.pending = [.shutdown]
+            // A driver released without a main-actor shutdown must not leave
+            // its clock alive through a producer that keeps this signal.
+            state.renderClock = nil
             guard !state.deliveryScheduled, let configuredSink = state.sink else { return }
             state.deliveryScheduled = true
             sink = configuredSink
@@ -149,13 +158,32 @@ final class FrameDriverSignal: Sendable {
             state.pending = []
             state.deliveryScheduled = false
             state.linkRunning = false
+            state.renderClock = nil
         }
+    }
+
+    /// Hands dirty marks from other threads to `clock` while it is set.
+    ///
+    /// The render thread then draws them with the view state main last
+    /// published, without a main-actor task. A mark made on main still goes
+    /// through the main actor, because a change on main can be a change to
+    /// the view state, which must be published before the frame that shows it.
+    @MainActor
+    fileprivate func setRenderClock(_ clock: RenderClock?) {
+        state.withLock { $0.renderClock = clock }
     }
 
     private func publish(_ events: Events) {
         var sink: Sink?
+        var clock: RenderClock?
         state.withLock { state in
             guard !state.shutdownRequested else { return }
+            if let renderClock = state.renderClock,
+               Events.renderable.isSuperset(of: events),
+               !Thread.isMainThread {
+                clock = renderClock
+                return
+            }
             state.pending.formUnion(events)
             // The running source's next tick consumes a dirty mark and a view
             // update. An immediate tick, a Core Video tick and shutdown
@@ -165,6 +193,7 @@ final class FrameDriverSignal: Sendable {
             state.deliveryScheduled = true
             sink = configuredSink
         }
+        clock?.requestFrame()
         schedule(sink)
     }
 
@@ -333,6 +362,9 @@ final class FrameDriver {
     private var idleTickCount = 0
     private var counters = FrameDriverCounters()
 
+    /// Draws the frames off main while set; see `attachRenderClock(_:)`.
+    private(set) var renderClock: RenderClock?
+
     private let displayLinkTarget = FrameDisplayLinkTarget()
     private var displayLinkBackend: FrameDisplayLinkBackend?
     private var manualTickSource: ManualTickSource?
@@ -389,6 +421,16 @@ final class FrameDriver {
         if events.contains(.viewUpdate) {
             onViewUpdate?()
         }
+        if renderClock != nil {
+            // The tick captures and publishes the view state and asks the
+            // clock for a frame; the clock does the waiting for the display.
+            if !events.isDisjoint(with: [.dirty, .immediate]) {
+                dirty = false
+                counters.frames += 1
+                onTick?()
+            }
+            return
+        }
         if events.contains(.dirty) {
             dirty = true
             if resumeOnMainIfNeeded() {
@@ -419,6 +461,32 @@ final class FrameDriver {
     /// Queues one coalesced main-actor tick without waiting for vsync.
     nonisolated func requestImmediateTick() {
         signal.requestImmediateTick()
+    }
+
+    /// Hands the frame cadence to `clock`, or takes it back with nil.
+    ///
+    /// While a clock is attached, this driver's own display link stays
+    /// stopped. Marks from other threads go straight to the clock; a mark made
+    /// on main, or a view update, runs `onTick` on main, which publishes the
+    /// view state and asks the clock for a frame. Visibility suspends the
+    /// clock instead of the link.
+    func attachRenderClock(_ clock: RenderClock?) {
+        guard clock !== renderClock, !invalidated else { return }
+        renderClock = clock
+        signal.setRenderClock(clock)
+        if let clock {
+            if running {
+                running = false
+                pauseBackendOnMain()
+            }
+            clock.setSuspended(visibilitySuspended)
+            if dirty {
+                dirty = false
+                onTick?()
+            }
+        } else if resumeOnMainIfNeeded() {
+            tickAfterResumeIfDue()
+        }
     }
 
     /// The clock used by the resume rate limit.
@@ -540,6 +608,7 @@ final class FrameDriver {
         let changed = visibilitySuspended != shouldSuspend
         let wasRunning = running
         visibilitySuspended = shouldSuspend
+        renderClock?.setSuspended(shouldSuspend)
         if shouldSuspend {
             running = false
         }
@@ -602,7 +671,7 @@ final class FrameDriver {
 
     @discardableResult
     private func resumeOnMainIfNeeded() -> Bool {
-        let shouldStart = !invalidated && dirty && !running
+        let shouldStart = !invalidated && dirty && !running && renderClock == nil
         guard shouldStart, canRunBackendOnMain() else { return false }
 
         startBackendOnMain()
@@ -664,6 +733,7 @@ final class FrameDriver {
         boundWindow = nil
 #endif
         displayLinkTarget.driver = nil
+        renderClock = nil
         onTick = nil
         onViewUpdate = nil
         signal.detachSink()

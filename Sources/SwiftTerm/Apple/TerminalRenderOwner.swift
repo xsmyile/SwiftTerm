@@ -42,6 +42,11 @@ final class TerminalRenderMailbox: Sendable {
         state.withLock { $0.latestViewState = viewState }
     }
 
+    /// The view state the next render-loop frame draws with.
+    var publishedViewState: FrameViewState? {
+        state.withLock { $0.latestViewState }
+    }
+
     func queueSize (cols: Int, rows: Int) {
         state.withLock {
             $0.pendingSize = FrameTerminalSize(cols: cols, rows: rows)
@@ -92,6 +97,78 @@ final class TerminalRenderMailbox: Sendable {
 #endif
             return request
         }
+    }
+}
+
+/// Frame side effects on their way from the render thread to the main actor.
+///
+/// A frame whose effects ask nothing of the main actor posts no task, and
+/// effects that arrive while a task is pending merge into it, so a busy main
+/// thread applies several frames' effects once.
+final class MainFrameEffectsMailbox: Sendable {
+    private struct State {
+        var pending: MainFrameEffects?
+        var lastBlinkRows: [Int] = []
+#if os(macOS)
+        var lastSelection: SnapshotSelectionState = .empty
+#endif
+    }
+
+    private let state = Locked(State())
+
+    /// Records one frame's effects. `scrolled` is true when the view has a
+    /// scroll to report. Returns true when the caller must post the task that
+    /// takes them: only the first effects after a `take` do.
+    func post (_ effects: MainFrameEffects, scrolled: Bool) -> Bool {
+        state.withLock { state in
+            if var pending = state.pending {
+                Self.merge(effects, into: &pending)
+                state.pending = pending
+                return false
+            }
+            var needsMain = scrolled
+                || effects.resizedTo != nil
+                || effects.rangeChanged != nil
+                || effects.notifyAccessibility
+                || effects.blinkRows != state.lastBlinkRows
+#if os(macOS)
+            needsMain = needsMain
+                || effects.scroller != nil
+                || effects.selection != state.lastSelection
+#endif
+            guard needsMain else { return false }
+            state.pending = effects
+            return true
+        }
+    }
+
+    /// Takes the merged effects for the main actor.
+    func take () -> MainFrameEffects? {
+        state.withLock { state in
+            guard let pending = state.pending else { return nil }
+            state.pending = nil
+            state.lastBlinkRows = pending.blinkRows
+#if os(macOS)
+            state.lastSelection = pending.selection
+#endif
+            return pending
+        }
+    }
+
+    private static func merge (_ newer: MainFrameEffects, into pending: inout MainFrameEffects) {
+        if let range = newer.rangeChanged {
+            pending.rangeChanged = pending.rangeChanged.map {
+                FrameChangedRange(start: min($0.start, range.start), end: max($0.end, range.end))
+            } ?? range
+        }
+        pending.notifyAccessibility = pending.notifyAccessibility || newer.notifyAccessibility
+        pending.scrollPosition = newer.scrollPosition
+        pending.blinkRows = newer.blinkRows
+        pending.resizedTo = newer.resizedTo ?? pending.resizedTo
+#if os(macOS)
+        pending.scroller = newer.scroller ?? pending.scroller
+        pending.selection = newer.selection
+#endif
     }
 }
 
@@ -146,6 +223,7 @@ private struct PendingSynchronizedOutputWatchdogUpdate: Sendable {
 /// -> TerminalLock`.
 final class TerminalRenderOwner: Sendable {
     let mailbox = TerminalRenderMailbox()
+    let mainEffects = MainFrameEffectsMailbox()
     let synchronizedOutputWatchdog = SynchronizedOutputWatchdog()
     private let session = Locked<TerminalRenderSession?>(nil)
     private let publishedVisibility = Locked(TerminalVisibility.potentiallyVisible)
