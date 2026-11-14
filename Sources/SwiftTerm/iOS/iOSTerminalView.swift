@@ -343,9 +343,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     nonisolated let diagnosticsState = Locked(TerminalView.Diagnostics())
 #if canImport(MetalKit)
-    var metalView: MTKView?
+    var metalView: (UIView & MetalRenderTarget)?
     private var metalDrawDelegate: MetalMainActorDrawDelegate?
-    private var useMetalRenderer = false
+    /// Prepares and draws frames off the main thread. Non-nil only for the
+    /// layer surface (io-gaps.md G1, WO-F4).
+    ///
+    /// Assigned on main, but read from the parse thread as well, so every
+    /// access goes through `viewStateLock` — see `activeRenderLoop()`.
+    var renderLoopStorage: RenderLoop?
+    var usesMetalLayerSurfaceSetting = TerminalView.defaultUsesMetalLayerSurface
+    var useMetalRenderer = false
 
     /// Whether the terminal view is currently using the Metal GPU renderer.
     ///
@@ -521,6 +528,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         refreshCachedViewState()
         frameDriver.markDirty()
         updateTextBlinkLifecycle()
+#if canImport(MetalKit)
+        // Nothing can see a frame drawn while the view is out of a window, and
+        // the render loop is the one path that does not wait for the frame
+        // driver, so it stops with the window and starts again with the next.
+        if window == nil {
+            stopRenderLoop()
+        } else if useMetalRenderer {
+            startRenderLoopIfNeeded()
+        }
+#endif
     }
 
 #if canImport(MetalKit)
@@ -557,7 +574,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
 
-    private func updateMetalRenderer(enabled: Bool) throws {
+    func updateMetalRenderer(enabled: Bool) throws {
         if enabled {
             if metalView != nil {
                 return
@@ -565,54 +582,75 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             guard let device = MTLCreateSystemDefaultDevice() else {
                 throw MetalError.deviceUnavailable
             }
-            let mtkView = MTKView(frame: bounds, device: device)
-            mtkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            mtkView.isPaused = true
-            mtkView.enableSetNeedsDisplay = true
-            mtkView.framebufferOnly = true
-            mtkView.colorPixelFormat = .bgra8Unorm
-            mtkView.isUserInteractionEnabled = false
-            // Tag the metal layer with sRGB so the compositor color-manages our
-            // pixels the same way as a regular UIView's layer. Without this,
-            // CAMetalLayer is untagged and raw bytes are treated as
-            // already-in-display-gamut, oversaturating colors on wide-gamut
-            // displays.
-            if let metalLayer = mtkView.layer as? CAMetalLayer {
-                metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
-                // Composite through the layer when the background is translucent
-                metalLayer.isOpaque = backgroundOpacity >= 1.0
-            }
-            let renderer = try MetalTerminalRenderer(target: mtkView)
+            let surface = makeMetalView(frame: bounds, device: device)
+            let renderer = try MetalTerminalRenderer(target: surface)
             let frameSignal = frameDriver.signal
             renderer.requestRedraw = { frameSignal.markDirty() }
-            renderOwner.installMetalRenderer(renderer, needsExternalDraw: false)
-            let drawDelegate = MetalMainActorDrawDelegate(terminalView: self,
-                                                          renderOwner: renderOwner)
-            mtkView.delegate = drawDelegate
+            renderOwner.installMetalRenderer(
+                renderer,
+                needsExternalDraw: surface.needsExternalDrawCall)
+            metalDrawDelegate = bindSurface(surface)
             if let caretView = caretView {
-                insertSubview(mtkView, belowSubview: caretView)
+                insertSubview(surface, belowSubview: caretView)
                 caretView.disableAnimations()
                 caretView.isHidden = true
             } else {
-                addSubview(mtkView)
+                addSubview(surface)
             }
-            metalView = mtkView
-            metalDrawDelegate = drawDelegate
+            metalView = surface
+            startRenderLoopIfNeeded()
             setNeedsDisplay(bounds)
-            mtkView.setNeedsDisplay(mtkView.bounds)
+            surface.requestDisplay()
         } else {
             precondition(terminal == nil || !terminal.terminalLock.isLockedByCurrentThread,
                          "Metal teardown cannot wait while the terminal lock is held")
+            stopRenderLoop()
             guard renderOwner.removeMetalRenderer() else {
+                startRenderLoopIfNeeded()
                 throw MetalError.rendererBusy
             }
             detachMetalRendererUI()
         }
     }
 
+    /// Builds the Metal surface that ``usesMetalLayerSurface`` selects.
+    private func makeMetalView(frame: CGRect, device: MTLDevice) -> (UIView & MetalRenderTarget) {
+        if usesMetalLayerSurfaceSetting {
+            let layerView = TerminalMetalLayerView(frame: frame)
+            layerView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            layerView.isUserInteractionEnabled = false
+            layerView.renderDevice = device
+            // The renderer lays cells out at the view's scale and sizes its
+            // viewport from the drawable, so the two must agree.
+            layerView.hostContentsScale = backingScaleFactor()
+            // Composite through the layer when the background is translucent.
+            // The layer view tags itself sRGB, as the MTKView path does below.
+            layerView.metalLayer.isOpaque = backgroundOpacity >= 1.0
+            return layerView
+        }
+        let mtkView = MTKView(frame: frame, device: device)
+        mtkView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        mtkView.isPaused = true
+        mtkView.enableSetNeedsDisplay = true
+        mtkView.framebufferOnly = true
+        mtkView.colorPixelFormat = .bgra8Unorm
+        mtkView.isUserInteractionEnabled = false
+        // Tag the metal layer with sRGB so the compositor color-manages our
+        // pixels the same way as a regular UIView's layer. Without this,
+        // CAMetalLayer is untagged and raw bytes are treated as
+        // already-in-display-gamut, oversaturating colors on wide-gamut
+        // displays.
+        if let metalLayer = mtkView.layer as? CAMetalLayer {
+            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            // Composite through the layer when the background is translucent
+            metalLayer.isOpaque = backgroundOpacity >= 1.0
+        }
+        return mtkView
+    }
+
     /// Detaches the Metal surface after the render owner has released it.
     private func detachMetalRendererUI() {
-        metalView?.delegate = nil
+        unbindSurface(metalView)
         metalView?.removeFromSuperview()
         metalView = nil
         metalDrawDelegate = nil
@@ -706,6 +744,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         uiShutdownState = .stopping
         frameDriver.shutdown()
 #if canImport(MetalKit)
+        stopRenderLoop()
         if useMetalRenderer {
             guard renderOwner.removeMetalRenderer() else { return false }
             detachMetalRendererUI()

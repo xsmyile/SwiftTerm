@@ -5,10 +5,10 @@ and draws frames off the main thread.
 
 ## Overview
 
-On macOS, a terminal using the GPU renderer now prepares and submits its frames
-on a dedicated render thread, driven by the display link. The main thread
-captures view state, signals the loop, and applies the AppKit side effects the
-loop hands back. Main-thread stall p99 under a flood drops from roughly 7–19 ms
+On macOS and iOS, a terminal using the GPU renderer now prepares and submits
+its frames on a dedicated render thread, driven by the display link. The main
+thread captures view state, signals the loop, and applies the AppKit or UIKit
+side effects the loop hands back. Main-thread stall p99 under a flood drops from roughly 7–19 ms
 to 0.03–0.12 ms.
 
 Most applications need few changes. View code must use the copied state and
@@ -46,8 +46,6 @@ a `CAMetalLayer` this view owns, drawn from the render loop, rather than an
   prepared off the main thread.
 - `SWIFTTERM_METAL_LAYER=0` in the environment starts on the old `MTKView`
   surface. That is the rollback if you hit something; please report it.
-
-`MTKView` remains the only surface on iOS.
 
 ## 3. You can call `send` and `feed` from any thread
 
