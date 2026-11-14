@@ -8,8 +8,9 @@ and draws frames off the main thread.
 On macOS and iOS, a terminal using the GPU renderer now prepares and submits
 its frames on a dedicated render thread, driven by the display link. The main
 thread captures view state, signals the loop, and applies the AppKit or UIKit
-side effects the loop hands back. Main-thread stall p99 under a flood drops from roughly 7–19 ms
-to 0.03–0.12 ms.
+side effects the loop hands back. On macOS, main-thread stall p99 under a
+flood drops from roughly 7–19 ms to 0.03–0.12 ms; on the iOS simulator, from
+4.3–4.8 ms to 0.09–0.10 ms.
 
 Most applications need few changes. View code must use the copied state and
 command APIs instead of retaining the view's internal ``Terminal``. The list
@@ -99,7 +100,8 @@ No action needed for any of these:
 - Input-to-glyph latency roughly halved; the old 150 ms post-input special case
   is gone.
 - The terminal stops drawing entirely when occluded, miniaturised, or the
-  application is hidden.
+  application is hidden, and on iOS while the application is in the
+  background or the view is out of a window.
 - The synchronized-output safety valve fires even while the main thread is
   blocked, so an application that sets DECSET 2026 and never clears it can no
   longer wedge the display.
