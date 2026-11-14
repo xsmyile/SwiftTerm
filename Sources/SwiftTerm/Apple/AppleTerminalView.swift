@@ -624,6 +624,29 @@ struct FrameTerminalSize: Sendable, Equatable {
     let rows: Int
 }
 
+/// Where a frame drew the cursor, as values the main actor can place the
+/// caret view with. The caret's text stays with `PreparedFrame`.
+struct FrameCursorPlacement: Sendable, Equatable {
+    let absoluteRow: Int
+    let screenRow: Int
+    let visualCol: Int
+    let columnWidth: Int
+    let renderMode: BufferLine.RenderLineMode
+    let hidden: Bool
+    /// The snapshot's row count, which bounds `screenRow`.
+    let rowCount: Int
+
+    init (_ cursor: SnapshotCursor, rowCount: Int) {
+        absoluteRow = cursor.absoluteRow
+        screenRow = cursor.screenRow
+        visualCol = cursor.visualCol
+        columnWidth = cursor.columnWidth
+        renderMode = cursor.renderMode
+        hidden = cursor.hidden
+        self.rowCount = rowCount
+    }
+}
+
 /// The complete render-to-main message for one frame.
 ///
 /// It contains only checked-Sendable values. Cursor render data stays with
@@ -634,6 +657,11 @@ struct MainFrameEffects: Sendable {
     var scrollPosition: Double
     var blinkRows: [Int] = []
     var resizedTo: FrameTerminalSize? = nil
+    /// Set by frames drawn off main: they cannot move the caret view, and
+    /// `caretFrame` and the marked-text overlay are placed from it. Nil on the
+    /// main-thread paths, which place it themselves. The outer optional is
+    /// "no placement"; an inner nil is a frame without a cursor.
+    var cursorPlacement: FrameCursorPlacement?? = nil
 #if os(macOS)
     var scroller: TerminalView.ScrollerState? = nil
     /// The selection the frame shows, so VoiceOver hears of a change to it
@@ -4200,6 +4228,9 @@ extension TerminalView {
         }
 #endif
         updateTextBlinkLifecycle(blinkRows: effects.blinkRows)
+        if let placement = effects.cursorPlacement {
+            placeCaret(placement)
+        }
 
         if let changed = effects.rangeChanged {
             terminalDelegate?.rangeChanged(source: self, startY: changed.start,
@@ -4433,32 +4464,40 @@ extension TerminalView {
 
     func updateCursorPosition (from cursor: SnapshotCursor?, rowCount: Int)
     {
+        placeCaret(cursor.map { FrameCursorPlacement($0, rowCount: rowCount) })
+        if let cursor, cursor.screenRow >= 0, cursor.screenRow < rowCount {
+            caretView?.setText(cursor.renderData)
+        }
+    }
+
+    /// Moves the caret view to where a frame drew the cursor.
+    func placeCaret (_ placement: FrameCursorPlacement?)
+    {
         guard let caretView else { return }
-        guard let cursor, cursor.screenRow >= 0,
-              cursor.screenRow < rowCount else {
+        guard let placement, placement.screenRow >= 0,
+              placement.screenRow < placement.rowCount else {
             caretView.removeFromSuperview()
             return
         }
-        if !cursor.hidden && caretView.superview != self {
+        if !placement.hidden && caretView.superview != self {
             addSubview(caretView)
-        } else if cursor.hidden && caretView.superview == self {
+        } else if placement.hidden && caretView.superview == self {
             caretView.removeFromSuperview()
         }
-        let doublePosition = cursor.renderMode == .single ? 1.0 : 2.0
+        let doublePosition = placement.renderMode == .single ? 1.0 : 2.0
         #if os(iOS) || os(visionOS)
-        let offset = cellDimension.height * CGFloat(cursor.absoluteRow)
+        let offset = cellDimension.height * CGFloat(placement.absoluteRow)
         let lineOrigin = CGPoint(x: 0, y: offset)
         #else
-        let offset = cellDimension.height * CGFloat(cursor.screenRow + 1)
+        let offset = cellDimension.height * CGFloat(placement.screenRow + 1)
         let lineOrigin = CGPoint(x: 0, y: frame.height - offset)
         #endif
         caretView.frame.origin = CGPoint(
-            x: lineOrigin.x + cellDimension.width * doublePosition * CGFloat(cursor.visualCol),
+            x: lineOrigin.x + cellDimension.width * doublePosition * CGFloat(placement.visualCol),
             y: lineOrigin.y)
         caretView.frame.size.width = cellDimension.width * doublePosition *
-            CGFloat(cursor.columnWidth)
-        caretView.powerlineRenderMode = cursor.renderMode
-        caretView.setText(cursor.renderData)
+            CGFloat(placement.columnWidth)
+        caretView.powerlineRenderMode = placement.renderMode
     }
     
     /// Queues a frame without waiting for the next display-link callback.
