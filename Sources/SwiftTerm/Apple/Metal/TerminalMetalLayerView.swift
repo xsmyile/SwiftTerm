@@ -179,9 +179,29 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
         onNeedsDisplay?()
     }
 #else
+    /// The scale the host lays its frames out at, or nil to follow the
+    /// display's.
+    ///
+    /// The renderer places cells at the scale of the frame it is given and
+    /// sizes its viewport from the drawable, so a host whose scale is not the
+    /// display's sets it here to keep the two in step.
+    var hostContentsScale: CGFloat? {
+        didSet {
+            guard hostContentsScale != oldValue else { return }
+            setNeedsLayout()
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
-        renderContentsScale = traitCollection.displayScale
+        let scale = hostContentsScale ?? traitCollection.displayScale
+        if scale > 0, metalLayer.contentsScale != scale {
+            metalLayer.contentsScale = scale
+        }
+        // A CAMetalLayer keeps the drawable size it was given, so a new size
+        // has to be set here: a rotation or a keyboard changes the bounds and
+        // not the scale.
+        updateDrawableSize()
         onNeedsDisplay?()
     }
 #endif
