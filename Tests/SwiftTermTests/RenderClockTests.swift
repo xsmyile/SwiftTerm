@@ -557,6 +557,94 @@ struct RenderClockTests {
         #expect(after != before, "\(setter.name) did not reach the published view state")
     }
 
+    /// End to end with the default clock: a window on the built-in display,
+    /// never key or front, output fed from another thread, and the main
+    /// thread stalled. Frames keep completing during the stall.
+    @available(macOS 14.0, *)
+    @Test(.enabled(if: RenderClockTests.metalIsUsable && RenderClockTests.hasBuiltInDisplay))
+    func defaultClockPresentsFramesDuringAMainStall() throws {
+        let screen = try #require(Self.builtInScreen)
+        let displayID = try #require(Self.displayID(screen))
+        let frame = NSRect(x: screen.visibleFrame.minX + 40, y: screen.visibleFrame.minY + 40,
+                           width: 480, height: 300)
+        let window = NeverKeyWindow(contentRect: NSRect(origin: .zero, size: frame.size),
+                                    styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.setFrame(frame, display: false)
+        try #require(screen.frame.contains(window.frame))
+        let view = TerminalView(frame: CGRect(origin: .zero, size: frame.size))
+        window.contentView = view
+        view.suspendsRenderingWhenNotVisible = false
+        try view.setUseMetal(true)
+        window.orderBack(nil)
+        defer {
+            _ = view.updateUiClosed()
+            window.orderOut(nil)
+            window.close()
+        }
+        #expect(view.frameDriver.renderClock != nil)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        try #require(Self.window(window.windowNumber, isOn: displayID))
+
+        let presented = Locked(0)
+        TerminalView.onFramePresented = { presented.withLock { $0 += 1 } }
+        defer { TerminalView.onFramePresented = nil }
+        let stop = Locked(false)
+        let sender = view.feedSender
+        let feeder = Thread {
+            var line = 0
+            while !stop.withLock({ $0 }) {
+                line += 1
+                sender.feed(text: "line \(line) of output fed while main is busy\r\n")
+                usleep(2000)
+            }
+        }
+        feeder.start()
+        defer { stop.withLock { $0 = true } }
+
+        presented.withLock { $0 = 0 }
+        let deadline = Date().addingTimeInterval(0.5)
+        while Date() < deadline {}
+        let duringStall = presented.withLock { $0 }
+        stop.withLock { $0 = true }
+
+        #expect(duringStall >= 15)
+    }
+
+    private final class NeverKeyWindow: NSWindow {
+        override var canBecomeKey: Bool { false }
+        override var canBecomeMain: Bool { false }
+    }
+
+    /// A built-in display is attached (not with the lid closed).
+    nonisolated static var hasBuiltInDisplay: Bool {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return false }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return false }
+        return displays.contains { CGDisplayIsBuiltin($0) != 0 }
+    }
+
+    static var builtInScreen: NSScreen? {
+        NSScreen.screens.first { screen in
+            displayID(screen).map { CGDisplayIsBuiltin($0) != 0 } ?? false
+        }
+    }
+
+    static func displayID(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
+            .map { CGDirectDisplayID($0.uint32Value) }
+    }
+
+    /// True when the window server puts the window inside the display.
+    static func window(_ number: Int, isOn display: CGDirectDisplayID) -> Bool {
+        guard let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(number))
+                as? [[String: Any]],
+              let bounds = info.first?[kCGWindowBounds as String] as? NSDictionary,
+              let rect = CGRect(dictionaryRepresentation: bounds) else { return false }
+        return CGDisplayBounds(display).contains(rect)
+    }
+
     /// The rule the clock relies on: a visible change made on main marks the
     /// frame dirty, and that mark publishes the new view state before the
     /// frame that shows it. A setter that changed the view without marking

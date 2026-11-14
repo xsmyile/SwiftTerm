@@ -4656,6 +4656,10 @@ extension TerminalView {
         /// Each one is a main-queue block that may take the terminal lock, so a
         /// large value relative to `frames` means callback amplification.
         public var mainHops: Int = 0
+        /// Main-actor tasks the frame driver ran to deliver producer events
+        /// (dirty marks, view updates). Each one wakes the main run loop, so
+        /// it should stay well below one per producer event.
+        public var frameDeliveries: Int = 0
         /// Frames prepared and drawn on the render loop rather than on the main
         /// thread. Zero when no render loop is running.
         public var renderLoopFrames: Int = 0
@@ -4712,6 +4716,7 @@ extension TerminalView {
         var result = diagnosticsState.withLock { $0 }
         let frameCounters = frameDriver?.currentCounters ?? FrameDriverCounters()
         result.ticks = frameCounters.ticks
+        result.frameDeliveries = frameCounters.deliveries
         result.frames = frameCounters.frames
         result.idleTicks = frameCounters.idleTicks
         result.pauses = frameCounters.pauses

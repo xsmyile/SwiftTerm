@@ -109,6 +109,7 @@ final class MainFrameEffectsMailbox: Sendable {
     private struct State {
         var pending: MainFrameEffects?
         var lastBlinkRows: [Int] = []
+        var lastCursorPlacement: FrameCursorPlacement?? = nil
 #if os(macOS)
         var lastSelection: SnapshotSelectionState = .empty
 #endif
@@ -131,6 +132,8 @@ final class MainFrameEffectsMailbox: Sendable {
                 || effects.rangeChanged != nil
                 || effects.notifyAccessibility
                 || effects.blinkRows != state.lastBlinkRows
+                || (effects.cursorPlacement != nil
+                    && effects.cursorPlacement != state.lastCursorPlacement)
 #if os(macOS)
             needsMain = needsMain
                 || effects.scroller != nil
@@ -148,6 +151,9 @@ final class MainFrameEffectsMailbox: Sendable {
             guard let pending = state.pending else { return nil }
             state.pending = nil
             state.lastBlinkRows = pending.blinkRows
+            if let placement = pending.cursorPlacement {
+                state.lastCursorPlacement = placement
+            }
 #if os(macOS)
             state.lastSelection = pending.selection
 #endif
@@ -165,6 +171,7 @@ final class MainFrameEffectsMailbox: Sendable {
         pending.scrollPosition = newer.scrollPosition
         pending.blinkRows = newer.blinkRows
         pending.resizedTo = newer.resizedTo ?? pending.resizedTo
+        pending.cursorPlacement = newer.cursorPlacement ?? pending.cursorPlacement
 #if os(macOS)
         pending.scroller = newer.scroller ?? pending.scroller
         pending.selection = newer.selection

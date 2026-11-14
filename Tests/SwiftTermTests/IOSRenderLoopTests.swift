@@ -232,6 +232,40 @@ struct IOSRenderLoopTests {
         #expect(view.renderOwner.completedMetalRenders == rendersBefore)
     }
 
+    /// End to end with the default clock: output fed from another thread
+    /// keeps completing frames while the main thread is stalled.
+    @Test(.enabled(if: IOSRenderLoopTests.metalIsUsable))
+    func defaultClockPresentsFramesDuringAMainStall() throws {
+        let (window, view) = makeWindowedView()
+        defer { close(view, window) }
+        try view.setUseMetal(true)
+        #expect(view.frameDriver.renderClock != nil)
+
+        let presented = Locked(0)
+        TerminalView.onFramePresented = { presented.withLock { $0 += 1 } }
+        defer { TerminalView.onFramePresented = nil }
+        let stop = Locked(false)
+        let sender = view.feedSender
+        let feeder = Thread {
+            var line = 0
+            while !stop.withLock({ $0 }) {
+                line += 1
+                sender.feed(text: "line \(line) of output fed while main is busy\r\n")
+                usleep(2000)
+            }
+        }
+        feeder.start()
+        defer { stop.withLock { $0 = true } }
+
+        presented.withLock { $0 = 0 }
+        _ = spinMainThread(timeout: 0.5) { false }
+        let duringStall = presented.withLock { $0 }
+        stop.withLock { $0 = true }
+
+        // 30 display periods at 60 Hz; slack for a loaded machine.
+        #expect(duringStall >= 10)
+    }
+
     /// Setters of inputs the frame captures that once relied on a later
     /// main-thread tick to be picked up. With the render clock only a dirty
     /// mark made on main publishes them, so each must reach the published

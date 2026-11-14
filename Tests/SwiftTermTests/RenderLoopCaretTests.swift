@@ -78,6 +78,8 @@ struct RenderLoopCaretTests {
         view.frameTick()
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline, abs(view.caretFrame.minX - cellWidth * 5) > 0.5 {
+            // A test window gets no display ticks: stand in for them.
+            view.frameDriver.renderClock?.sourceDidTick()
             await drainMainQueue()
         }
         #expect(abs(view.caretFrame.minX - cellWidth * 5) <= 0.5)
@@ -86,6 +88,8 @@ struct RenderLoopCaretTests {
         view.frameTick()
         let next = Date().addingTimeInterval(2)
         while Date() < next, abs(view.caretFrame.minX - cellWidth * 2) > 0.5 {
+            // A test window gets no display ticks: stand in for them.
+            view.frameDriver.renderClock?.sourceDidTick()
             await drainMainQueue()
         }
         #expect(abs(view.caretFrame.minX - cellWidth * 2) <= 0.5)
