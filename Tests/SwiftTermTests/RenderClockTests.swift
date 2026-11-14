@@ -187,12 +187,15 @@ struct RenderClockTests {
         #expect(driver.currentCounters.deliveries == 1)
     }
 
-    @Test func viewUpdatesRunOnMainBeforeTheTick() async {
+    /// A view update from another thread runs on main, and its dirty mark
+    /// goes to the clock: main does not tick for it, so a program that ends
+    /// synchronized output on every frame does not get each frame drawn twice.
+    @Test func viewUpdatesRunOnMainAndTheirMarkGoesToTheClock() async {
         let driver = FrameDriver(tickSource: ManualTickSource())
         var order: [String] = []
         driver.onViewUpdate = { order.append("update") }
         driver.onTick = { order.append("tick") }
-        let (clock, _, loop, _) = makeClock()
+        let (clock, _, loop, frames) = makeClock()
         defer { clock.invalidate(); loop.invalidate(); driver.invalidate() }
         driver.attachRenderClock(clock)
 
@@ -200,7 +203,8 @@ struct RenderClockTests {
         await Task.detached { signal.requestViewUpdate() }.value
         await drainMainQueue()
 
-        #expect(order == ["update", "tick"])
+        #expect(order == ["update"])
+        #expect(waitUntil { frames.value == 1 })
     }
 
     /// A program that ends synchronized output on every frame sends a view

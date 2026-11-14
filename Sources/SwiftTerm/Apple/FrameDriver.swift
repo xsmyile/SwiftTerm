@@ -224,17 +224,22 @@ final class FrameDriverSignal: Sendable {
 
     private func publish(_ events: Events) {
         var sink: Sink?
+        var events = events
 #if os(macOS) || os(iOS) || os(visionOS)
         var clock: RenderClock?
 #endif
         state.withLock { state in
             guard !state.shutdownRequested else { return }
 #if os(macOS) || os(iOS) || os(visionOS)
-            if let renderClock = state.renderClock,
-               Events.renderable.isSuperset(of: events),
-               !Thread.isMainThread {
+            // From another thread a dirty mark is terminal content, which the
+            // clock draws by itself; only the rest, such as a view update,
+            // needs the main actor. Sending the mark there too would draw
+            // every such change twice.
+            if let renderClock = state.renderClock, !Thread.isMainThread,
+               !events.isDisjoint(with: Events.renderable) {
                 clock = renderClock
-                return
+                events.subtract(Events.renderable)
+                if events.isEmpty { return }
             }
 #endif
             state.pending.formUnion(events)
