@@ -1644,7 +1644,10 @@ extension TerminalView {
     /// Defaults to `true` (standard macOS font smoothing).
     @objc open var fontSmoothing: Bool {
         get { _fontSmoothing }
-        set { _fontSmoothing = newValue }
+        set {
+            _fontSmoothing = newValue
+            frameDriver?.markDirty()
+        }
     }
 #endif
 
@@ -4155,7 +4158,8 @@ extension TerminalView {
     ///
     /// Always runs on the main thread. When a render loop is active this does
     /// almost nothing: it captures the view state and hands the frame over
-    /// (io-gaps.md G1, WO-F4).
+    /// (io-gaps.md G1, WO-F4). With a render clock it runs only when main
+    /// changed something, and the clock decides when the frame is drawn.
     func frameTick ()
     {
         let tick = Profiling.begin(.frameTick)
@@ -4164,7 +4168,11 @@ extension TerminalView {
 #if canImport(MetalKit)
         if usesRenderLoop {
             publishFrameViewState(viewState)
-            renderLoop?.signal()
+            if let clock = frameDriver.renderClock {
+                clock.requestFrame(soon: true)
+            } else {
+                renderLoop?.signal()
+            }
             return
         }
 #endif
@@ -4190,10 +4198,13 @@ extension TerminalView {
 
     /// Hands the capture to the render loop.
     ///
-    /// Republished every tick rather than invalidated whenever a font, color or
-    /// selection changes: capturing costs microseconds and there is no list of
-    /// setters to keep in step, which is the failure mode a cache invalidation
-    /// scheme would have.
+    /// Republished on every main-thread tick rather than invalidated whenever
+    /// a font, color or selection changes: capturing costs microseconds and
+    /// there is no list of setters to keep in step, which is the failure mode
+    /// a cache invalidation scheme would have. With a render clock the main
+    /// thread ticks only when it marks the frame dirty itself, which every
+    /// visible change on main already does: without the mark, an idle driver
+    /// would never draw the change.
     func publishFrameViewState (_ viewState: FrameViewState)
     {
         renderOwner.mailbox.publish(viewState)
@@ -4353,17 +4364,28 @@ extension TerminalView {
             return
         }
         let owner = renderOwner
-        let applyEffects: @MainActor @Sendable (MainFrameEffects) -> Void = { [weak self] effects in
+        let crossThreadState = crossThreadState
+        let applyEffects: @MainActor @Sendable () -> Void = { [weak self] in
+            guard let effects = owner.mainEffects.take() else { return }
             self?.applyFrameSideEffects(effects)
         }
         let loop = RenderLoop {
             guard let effects = owner.renderPublishedFrame() else { return }
-            Task { @MainActor in applyEffects(effects) }
+            let scrolled = crossThreadState.withLock { $0.scrolledDirty }
+            if owner.mainEffects.post(effects, scrolled: scrolled) {
+                Task { @MainActor in applyEffects() }
+            }
         }
         viewStateLock.lock()
         renderLoopStorage = loop
         viewStateLock.unlock()
         loop.start()
+        if let viewState = captureFrameViewState() {
+            publishFrameViewState(viewState)
+        }
+        if let source = makeRenderClockSource() {
+            frameDriver.attachRenderClock(RenderClock(loop: loop, source: source))
+        }
     }
 
     /// Runs `body` on the main thread with no frame in flight.
@@ -4379,11 +4401,39 @@ extension TerminalView {
     }
 
     func stopRenderLoop () {
+        let clock = frameDriver.renderClock
+        frameDriver.attachRenderClock(nil)
+        clock?.invalidate()
         viewStateLock.lock()
         let loop = renderLoopStorage
         renderLoopStorage = nil
         viewStateLock.unlock()
         loop?.invalidate()
+    }
+
+    /// Whether the render loop takes its cadence from a display link on a
+    /// thread of its own rather than from the main thread's frame ticks.
+    /// `SWIFTTERM_RENDER_CLOCK=0` keeps the main-thread ticks.
+    static let defaultUsesRenderClock =
+        ProcessInfo.processInfo.environment["SWIFTTERM_RENDER_CLOCK"] != "0"
+
+    /// The display link the render clock ticks from, or nil to keep the
+    /// main-thread ticks: on macOS before 14 there is no display link that
+    /// runs off the main run loop without a screen of its own.
+    private func makeRenderClockSource () -> (any RenderClockSource)? {
+        guard TerminalView.defaultUsesRenderClock else { return nil }
+#if os(macOS)
+        guard #available(macOS 14.0, *),
+              ProcessInfo.processInfo.environment["SWIFTTERM_FORCE_CVDISPLAYLINK"] != "1"
+        else { return nil }
+        return DisplayLinkRenderClockSource { target, selector in
+            self.displayLink(target: target, selector: selector)
+        }
+#else
+        return DisplayLinkRenderClockSource { target, selector in
+            CADisplayLink(target: target, selector: selector)
+        }
+#endif
     }
 
     /// The value `usesMetalLayerSurface` starts at. `SWIFTTERM_METAL_LAYER=0`
@@ -4606,6 +4656,10 @@ extension TerminalView {
         /// Each one is a main-queue block that may take the terminal lock, so a
         /// large value relative to `frames` means callback amplification.
         public var mainHops: Int = 0
+        /// Main-actor tasks the frame driver ran to deliver producer events
+        /// (dirty marks, view updates). Each one wakes the main run loop, so
+        /// it should stay well below one per producer event.
+        public var frameDeliveries: Int = 0
         /// Frames prepared and drawn on the render loop rather than on the main
         /// thread. Zero when no render loop is running.
         public var renderLoopFrames: Int = 0
@@ -4662,6 +4716,7 @@ extension TerminalView {
         var result = diagnosticsState.withLock { $0 }
         let frameCounters = frameDriver?.currentCounters ?? FrameDriverCounters()
         result.ticks = frameCounters.ticks
+        result.frameDeliveries = frameCounters.deliveries
         result.frames = frameCounters.frames
         result.idleTicks = frameCounters.idleTicks
         result.pauses = frameCounters.pauses

@@ -35,6 +35,11 @@ final class FrameDriverSignal: Sendable {
 
         /// Events that a running source's next tick can consume.
         static let deferrable: Events = [.dirty, .viewUpdate]
+
+#if os(macOS) || os(iOS) || os(visionOS)
+        /// Events a render clock can draw without the main actor.
+        static let renderable: Events = [.dirty, .immediate]
+#endif
     }
 
     typealias Sink = @MainActor @Sendable () -> Void
@@ -48,6 +53,11 @@ final class FrameDriverSignal: Sendable {
         var shutdownRequested = false
         var sinkConfigured = false
         var sink: Sink?
+#if os(macOS) || os(iOS) || os(visionOS)
+        /// Set while a render clock draws the frames. A dirty mark from a
+        /// thread other than main then goes straight to it.
+        var renderClock: RenderClock?
+#endif
     }
 
     private let state = Locked(State())
@@ -98,6 +108,11 @@ final class FrameDriverSignal: Sendable {
             guard !state.shutdownRequested else { return }
             state.shutdownRequested = true
             state.pending = [.shutdown]
+#if os(macOS) || os(iOS) || os(visionOS)
+            // A driver released without a main-actor shutdown must not leave
+            // its clock alive through a producer that keeps this signal.
+            state.renderClock = nil
+#endif
             guard !state.deliveryScheduled, let configuredSink = state.sink else { return }
             state.deliveryScheduled = true
             sink = configuredSink
@@ -149,13 +164,84 @@ final class FrameDriverSignal: Sendable {
             state.pending = []
             state.deliveryScheduled = false
             state.linkRunning = false
+#if os(macOS) || os(iOS) || os(visionOS)
+            state.renderClock = nil
+#endif
         }
     }
 
-    private func publish(_ events: Events) {
+#if os(macOS) || os(iOS) || os(visionOS)
+    /// Hands dirty marks from other threads to `clock` while it is set.
+    ///
+    /// The render thread then draws them with the view state main last
+    /// published, without a main-actor task. A mark made on main, and a view
+    /// update, still go through the main actor, because they can change the
+    /// view state, which must be published before the frame that shows it.
+    /// While the clock's link runs they wait for its next tick, which posts
+    /// at most one main-actor task, the way the main link's tick consumed
+    /// them before.
+    @MainActor
+    fileprivate func setRenderClock(_ clock: RenderClock?) {
+        clock?.setCadenceObserver { [weak self] clock, cadence in
+            self?.renderClockCadence(cadence, from: clock)
+        }
         var sink: Sink?
         state.withLock { state in
+            state.renderClock = clock
+            // Until the new clock reports its cadence, nothing waits for it.
+            state.linkRunning = false
+            guard !state.pending.isEmpty, !state.deliveryScheduled,
+                  let configuredSink = state.sink else { return }
+            state.deliveryScheduled = true
+            sink = configuredSink
+        }
+        schedule(sink)
+    }
+
+    /// Follows the attached clock's link: while it runs, a deferrable event
+    /// waits for its tick, and a tick or a stop delivers what is pending.
+    private func renderClockCadence(_ cadence: RenderClockCadence, from clock: RenderClock) {
+        var sink: Sink?
+        state.withLock { state in
+            guard state.renderClock === clock else { return }
+            switch cadence {
+            case .started:
+                state.linkRunning = true
+                return
+            case .tick:
+                state.linkRunning = true
+            case .stopped:
+                state.linkRunning = false
+            }
+            guard !state.pending.isEmpty, !state.deliveryScheduled,
+                  let configuredSink = state.sink else { return }
+            state.deliveryScheduled = true
+            sink = configuredSink
+        }
+        schedule(sink)
+    }
+#endif
+
+    private func publish(_ events: Events) {
+        var sink: Sink?
+        var events = events
+#if os(macOS) || os(iOS) || os(visionOS)
+        var clock: RenderClock?
+#endif
+        state.withLock { state in
             guard !state.shutdownRequested else { return }
+#if os(macOS) || os(iOS) || os(visionOS)
+            // From another thread a dirty mark is terminal content, which the
+            // clock draws by itself; only the rest, such as a view update,
+            // needs the main actor. Sending the mark there too would draw
+            // every such change twice.
+            if let renderClock = state.renderClock, !Thread.isMainThread,
+               !events.isDisjoint(with: Events.renderable) {
+                clock = renderClock
+                events.subtract(Events.renderable)
+                if events.isEmpty { return }
+            }
+#endif
             state.pending.formUnion(events)
             // The running source's next tick consumes a dirty mark and a view
             // update. An immediate tick, a Core Video tick and shutdown
@@ -165,6 +251,9 @@ final class FrameDriverSignal: Sendable {
             state.deliveryScheduled = true
             sink = configuredSink
         }
+#if os(macOS) || os(iOS) || os(visionOS)
+        clock?.requestFrame()
+#endif
         schedule(sink)
     }
 
@@ -333,6 +422,11 @@ final class FrameDriver {
     private var idleTickCount = 0
     private var counters = FrameDriverCounters()
 
+#if os(macOS) || os(iOS) || os(visionOS)
+    /// Draws the frames off main while set; see `attachRenderClock(_:)`.
+    private(set) var renderClock: RenderClock?
+#endif
+
     private let displayLinkTarget = FrameDisplayLinkTarget()
     private var displayLinkBackend: FrameDisplayLinkBackend?
     private var manualTickSource: ManualTickSource?
@@ -389,6 +483,18 @@ final class FrameDriver {
         if events.contains(.viewUpdate) {
             onViewUpdate?()
         }
+#if os(macOS) || os(iOS) || os(visionOS)
+        if renderClock != nil {
+            // The tick captures and publishes the view state and asks the
+            // clock for a frame; the clock does the waiting for the display.
+            if !events.isDisjoint(with: [.dirty, .immediate]) {
+                dirty = false
+                counters.frames += 1
+                onTick?()
+            }
+            return
+        }
+#endif
         if events.contains(.dirty) {
             dirty = true
             if resumeOnMainIfNeeded() {
@@ -420,6 +526,34 @@ final class FrameDriver {
     nonisolated func requestImmediateTick() {
         signal.requestImmediateTick()
     }
+
+#if os(macOS) || os(iOS) || os(visionOS)
+    /// Hands the frame cadence to `clock`, or takes it back with nil.
+    ///
+    /// While a clock is attached, this driver's own display link stays
+    /// stopped. Marks from other threads go straight to the clock; a mark made
+    /// on main, or a view update, runs `onTick` on main, which publishes the
+    /// view state and asks the clock for a frame. Visibility suspends the
+    /// clock instead of the link.
+    func attachRenderClock(_ clock: RenderClock?) {
+        guard clock !== renderClock, !invalidated else { return }
+        renderClock = clock
+        signal.setRenderClock(clock)
+        if let clock {
+            if running {
+                running = false
+                pauseBackendOnMain()
+            }
+            clock.setSuspended(visibilitySuspended)
+            if dirty {
+                dirty = false
+                onTick?()
+            }
+        } else if resumeOnMainIfNeeded() {
+            tickAfterResumeIfDue()
+        }
+    }
+#endif
 
     /// The clock used by the resume rate limit.
     var nowUptimeNs: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
@@ -540,6 +674,9 @@ final class FrameDriver {
         let changed = visibilitySuspended != shouldSuspend
         let wasRunning = running
         visibilitySuspended = shouldSuspend
+#if os(macOS) || os(iOS) || os(visionOS)
+        renderClock?.setSuspended(shouldSuspend)
+#endif
         if shouldSuspend {
             running = false
         }
@@ -602,7 +739,12 @@ final class FrameDriver {
 
     @discardableResult
     private func resumeOnMainIfNeeded() -> Bool {
-        let shouldStart = !invalidated && dirty && !running
+#if os(macOS) || os(iOS) || os(visionOS)
+        let clockDrawsFrames = renderClock != nil
+#else
+        let clockDrawsFrames = false
+#endif
+        let shouldStart = !invalidated && dirty && !running && !clockDrawsFrames
         guard shouldStart, canRunBackendOnMain() else { return false }
 
         startBackendOnMain()
@@ -664,6 +806,9 @@ final class FrameDriver {
         boundWindow = nil
 #endif
         displayLinkTarget.driver = nil
+#if os(macOS) || os(iOS) || os(visionOS)
+        renderClock = nil
+#endif
         onTick = nil
         onViewUpdate = nil
         signal.detachSink()

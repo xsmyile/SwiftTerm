@@ -73,6 +73,7 @@ struct IOSRenderLoopTests {
         #expect(view.usesMetalLayerSurface)
         #expect(view.metalView is TerminalMetalLayerView)
         #expect(view.isUsingRenderLoop)
+        #expect(view.frameDriver.renderClock != nil)
     }
 
     /// The frame tick on main only captures the view state and signals the
@@ -229,6 +230,88 @@ struct IOSRenderLoopTests {
         view.layoutIfNeeded()
 
         #expect(view.renderOwner.completedMetalRenders == rendersBefore)
+    }
+
+    /// End to end with the default clock: output fed from another thread
+    /// keeps completing frames while the main thread is stalled.
+    @Test(.enabled(if: IOSRenderLoopTests.metalIsUsable))
+    func defaultClockPresentsFramesDuringAMainStall() throws {
+        let (window, view) = makeWindowedView()
+        defer { close(view, window) }
+        try view.setUseMetal(true)
+        #expect(view.frameDriver.renderClock != nil)
+
+        let presented = Locked(0)
+        TerminalView.onFramePresented = { presented.withLock { $0 += 1 } }
+        defer { TerminalView.onFramePresented = nil }
+        let stop = Locked(false)
+        let sender = view.feedSender
+        let feeder = Thread {
+            var line = 0
+            while !stop.withLock({ $0 }) {
+                line += 1
+                sender.feed(text: "line \(line) of output fed while main is busy\r\n")
+                usleep(2000)
+            }
+        }
+        feeder.start()
+        defer { stop.withLock { $0 = true } }
+
+        presented.withLock { $0 = 0 }
+        _ = spinMainThread(timeout: 0.5) { false }
+        let duringStall = presented.withLock { $0 }
+        stop.withLock { $0 = true }
+
+        // 30 display periods at 60 Hz; slack for a loaded machine.
+        #expect(duringStall >= 10)
+    }
+
+    /// Setters of inputs the frame captures that once relied on a later
+    /// main-thread tick to be picked up. With the render clock only a dirty
+    /// mark made on main publishes them, so each must reach the published
+    /// view state while only background output and the clock drive frames.
+    @Test(.enabled(if: IOSRenderLoopTests.metalIsUsable),
+          arguments: ["caretColor", "caretTextColor", "metalBufferingMode", "notifyUpdateChanges",
+                      "commandActive", "textBlinkVisible", "linkHighlightRange", "nativeForegroundColor"])
+    func capturedSettersReachTheNextFrame(name: String) async throws {
+        let (window, view) = makeWindowedView()
+        defer { close(view, window) }
+        try view.setUseMetal(true)
+        let loop = try #require(view.renderLoop)
+        let source = ManualRenderClockSource()
+        let old = view.frameDriver.renderClock
+        view.frameDriver.attachRenderClock(RenderClock(loop: loop, source: source))
+        old?.invalidate()
+        await drainMainQueue()
+        let read: (FrameViewState) -> String
+        switch name {
+        case "caretColor":
+            read = { "\($0.caretColor)" }; view.caretColor = .systemPink
+        case "caretTextColor":
+            read = { "\($0.caretTextColor)" }; view.caretTextColor = .systemTeal
+        case "metalBufferingMode":
+            read = { "\($0.metalBufferingMode)" }; view.metalBufferingMode = .perFrameAggregated
+        case "notifyUpdateChanges":
+            read = { "\($0.notifyUpdateChanges)" }; view.notifyUpdateChanges.toggle()
+        case "commandActive":
+            read = { "\($0.commandActive)" }; view.commandActive.toggle()
+        case "textBlinkVisible":
+            read = { "\($0.textBlinkVisible)" }; view.textBlinkVisible.toggle()
+        case "linkHighlightRange":
+            read = { "\($0.linkHighlightRange as Any)" }; view.linkHighlightRange = [.init(row: 0, range: 0..<4)]
+        default:
+            read = { "\($0.effectiveForegroundColor)" }; view.nativeForegroundColor = .systemOrange
+        }
+        await drainMainQueue()
+        let sender = view.feedSender
+        await Task.detached {
+            sender.feed(text: "background output\r\n")
+            source.tick()
+        }.value
+
+        let published = read(try #require(view.renderOwner.mailbox.publishedViewState))
+        #expect(published == read(FrameViewState(view: view)),
+                "\(name) did not reach the published view state")
     }
 
     /// A rotation or the keyboard resizes the layer without changing its

@@ -306,7 +306,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     // effectiveNativeForegroundColor for why draw paths must not read the
     // terminal's flag directly. Access via reverseColorsActiveValue()/
     // setReverseColorsActive().
-    var textBlinkVisible = true
+    /// Captured by every frame, like every input of `FrameViewState`: a change
+    /// marks the frame dirty, which is how it reaches a frame drawn off main.
+    var textBlinkVisible = true {
+        didSet {
+            guard textBlinkVisible != oldValue else { return }
+            frameDriver?.markDirty()
+        }
+    }
     var textBlinkTimer: Timer?
     var textBlinkObservers: [(NotificationCenter, NSObjectProtocol)] = []
     var textBlinkApplicationActive = true
@@ -353,7 +360,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     ///
     /// You can change this property at any time; the renderer picks up the
     /// new mode on the next frame.
-    public var metalBufferingMode: MetalBufferingMode = .perRowPersistent
+    public var metalBufferingMode: MetalBufferingMode = .perRowPersistent {
+        didSet { frameDriver?.markDirty() }
+    }
 
     /// Overrides the backing scale used by the Metal renderer.
     ///
@@ -1362,6 +1371,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         set {
             cursorColorIsDefault = false
             caretView.caretColor = newValue
+            frameDriver.markDirty()
         }
     }
 
@@ -1372,6 +1382,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         set {
             cursorTextColorIsDefault = newValue == nil
             caretView.caretTextColor = newValue
+            frameDriver.markDirty()
         }
     }
 
@@ -1632,13 +1643,20 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
-    var linkHighlightRange: [Terminal.LinkMatch.RowRange]?
+    var linkHighlightRange: [Terminal.LinkMatch.RowRange]? {
+        didSet {
+            guard linkHighlightRange != oldValue else { return }
+            frameDriver?.markDirty()
+        }
+    }
 
     /**
      * If set to true, this will call the TerminalViewDelegate's rangeChanged method
      * when there are changes that are being performed on the UI
      */
-    public var notifyUpdateChanges = false
+    public var notifyUpdateChanges = false {
+        didSet { frameDriver?.markDirty() }
+    }
 
     func updateDebugDisplay()
     {
@@ -2131,7 +2149,12 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
     
     // If true, the Command key has been pressed
-    var commandActive = false
+    var commandActive = false {
+        didSet {
+            guard commandActive != oldValue else { return }
+            frameDriver?.markDirty()
+        }
+    }
     
     // We monitor the flags changed to enable URL previews on mouse-hover like iTerm
     // when the Command key is pressed.
