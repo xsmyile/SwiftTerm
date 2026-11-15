@@ -15,9 +15,13 @@
 //
 
 #if !SWIFTTERM_EMBEDDED
-#if os(macOS) && canImport(MetalKit)
+#if (os(macOS) || os(iOS) || os(visionOS)) && canImport(MetalKit)
 import Foundation
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import Metal
 import MetalKit
 import QuartzCore
@@ -114,8 +118,13 @@ extension TerminalView {
     private static func renderPixels(source: TerminalView,
                                      target: any MetalRenderTarget,
                                      size: CGSize) -> [UInt8]? {
-        target.renderContentsScale = 1
-        target.renderDrawableSize = size
+        // The renderer places cells at the source's scale and sizes its
+        // viewport from the drawable. On iOS that scale is the screen's, and
+        // a 1x drawable would show only the bottom of the view.
+        let scale = source.captureFrameViewState()?.renderingScale ?? 1
+        target.renderContentsScale = scale
+        target.renderDrawableSize = CGSize(width: size.width * scale,
+                                           height: size.height * scale)
         guard let renderer = try? MetalTerminalRenderer(target: target) else {
             return nil
         }

@@ -41,6 +41,9 @@ typealias TerminalMetalLayerViewBase = UIView
 private final class TerminalMetalLayerRenderSurface: @unchecked Sendable, MetalRenderSurface {
     private let layer: CAMetalLayer
     private let publishedGeometry: Locked<MetalSurfaceGeometry>
+    /// Main's copy of `layer.presentsWithTransaction`, so the render thread
+    /// never reads layer configuration.
+    private let presentsWithTransaction = Locked(false)
 
     init(layer: CAMetalLayer, geometry: MetalSurfaceGeometry) {
         self.layer = layer
@@ -49,6 +52,10 @@ private final class TerminalMetalLayerRenderSurface: @unchecked Sendable, MetalR
 
     func publish(_ geometry: MetalSurfaceGeometry) {
         publishedGeometry.withLock { $0 = geometry }
+    }
+
+    func publishPresentsWithTransaction(_ value: Bool) {
+        presentsWithTransaction.withLock { $0 = value }
     }
 
     func acquireDrawableFrame() -> MetalDrawableFrame? {
@@ -63,7 +70,8 @@ private final class TerminalMetalLayerRenderSurface: @unchecked Sendable, MetalR
         color?.storeAction = .store
         return MetalDrawableFrame(drawable: drawable,
                                   renderPassDescriptor: descriptor,
-                                  geometry: geometry)
+                                  geometry: geometry,
+                                  presentsWithTransaction: presentsWithTransaction.withLock { $0 })
     }
 }
 
@@ -154,6 +162,16 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
         renderSurfaceStorage.publish(renderGeometry)
     }
 
+    /// Makes the frames drawn while it is on join the current Core Animation
+    /// transaction, so a drawable of a new size reaches the screen together
+    /// with the bounds it was drawn for. Only for a frame drawn synchronously
+    /// on main, with the render loop suspended: a present that waits for the
+    /// transaction cannot come from another thread.
+    func setPresentsWithTransaction(_ value: Bool) {
+        metalLayer.presentsWithTransaction = value
+        renderSurfaceStorage.publishPresentsWithTransaction(value)
+    }
+
 #if os(macOS)
     override func makeBackingLayer() -> CALayer {
         let metal = CAMetalLayer()
@@ -179,9 +197,29 @@ final class TerminalMetalLayerView: TerminalMetalLayerViewBase {
         onNeedsDisplay?()
     }
 #else
+    /// The scale the host lays its frames out at, or nil to follow the
+    /// display's.
+    ///
+    /// The renderer places cells at the scale of the frame it is given and
+    /// sizes its viewport from the drawable, so a host whose scale is not the
+    /// display's sets it here to keep the two in step.
+    var hostContentsScale: CGFloat? {
+        didSet {
+            guard hostContentsScale != oldValue else { return }
+            setNeedsLayout()
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
-        renderContentsScale = traitCollection.displayScale
+        let scale = hostContentsScale ?? traitCollection.displayScale
+        if scale > 0, metalLayer.contentsScale != scale {
+            metalLayer.contentsScale = scale
+        }
+        // A CAMetalLayer keeps the drawable size it was given, so a new size
+        // has to be set here: a rotation or a keyboard changes the bounds and
+        // not the scale.
+        updateDrawableSize()
         onNeedsDisplay?()
     }
 #endif

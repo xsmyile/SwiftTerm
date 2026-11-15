@@ -509,7 +509,11 @@ final class TerminalRenderOwner: Sendable {
             renderMetal()
         }
 #endif
-        return prepared.mainEffects
+        var effects = prepared.mainEffects
+        effects.cursorPlacement = .some(prepared.cursor.map {
+            FrameCursorPlacement($0, rowCount: prepared.cursorRowCount)
+        })
+        return effects
     }
 
     @MainActor

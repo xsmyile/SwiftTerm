@@ -624,6 +624,29 @@ struct FrameTerminalSize: Sendable, Equatable {
     let rows: Int
 }
 
+/// Where a frame drew the cursor, as values the main actor can place the
+/// caret view with. The caret's text stays with `PreparedFrame`.
+struct FrameCursorPlacement: Sendable, Equatable {
+    let absoluteRow: Int
+    let screenRow: Int
+    let visualCol: Int
+    let columnWidth: Int
+    let renderMode: BufferLine.RenderLineMode
+    let hidden: Bool
+    /// The snapshot's row count, which bounds `screenRow`.
+    let rowCount: Int
+
+    init (_ cursor: SnapshotCursor, rowCount: Int) {
+        absoluteRow = cursor.absoluteRow
+        screenRow = cursor.screenRow
+        visualCol = cursor.visualCol
+        columnWidth = cursor.columnWidth
+        renderMode = cursor.renderMode
+        hidden = cursor.hidden
+        self.rowCount = rowCount
+    }
+}
+
 /// The complete render-to-main message for one frame.
 ///
 /// It contains only checked-Sendable values. Cursor render data stays with
@@ -634,6 +657,11 @@ struct MainFrameEffects: Sendable {
     var scrollPosition: Double
     var blinkRows: [Int] = []
     var resizedTo: FrameTerminalSize? = nil
+    /// Set by frames drawn off main: they cannot move the caret view, and
+    /// `caretFrame` and the marked-text overlay are placed from it. Nil on the
+    /// main-thread paths, which place it themselves. The outer optional is
+    /// "no placement"; an inner nil is a frame without a cursor.
+    var cursorPlacement: FrameCursorPlacement?? = nil
 #if os(macOS)
     var scroller: TerminalView.ScrollerState? = nil
     /// The selection the frame shows, so VoiceOver hears of a change to it
@@ -4133,7 +4161,7 @@ extension TerminalView {
         let tick = Profiling.begin(.frameTick)
         defer { tick.end() }
         guard let viewState = captureFrameViewState() else { return }
-#if os(macOS) && canImport(MetalKit)
+#if canImport(MetalKit)
         if usesRenderLoop {
             publishFrameViewState(viewState)
             renderLoop?.signal()
@@ -4200,6 +4228,9 @@ extension TerminalView {
         }
 #endif
         updateTextBlinkLifecycle(blinkRows: effects.blinkRows)
+        if let placement = effects.cursorPlacement {
+            placeCaret(placement)
+        }
 
         if let changed = effects.rangeChanged {
             terminalDelegate?.rangeChanged(source: self, startY: changed.start,
@@ -4277,6 +4308,155 @@ extension TerminalView {
     }
 #endif
 
+#if canImport(MetalKit)
+    /// The running render loop, or nil. Safe from any thread.
+    ///
+    /// The loop is assigned on main but read from the parse thread as well, so
+    /// every access goes through `viewStateLock`.
+    func activeRenderLoop () -> RenderLoop? {
+        viewStateLock.lock()
+        let loop = renderLoopStorage
+        viewStateLock.unlock()
+        guard let loop, loop.isRunning else { return nil }
+        return loop
+    }
+
+    var renderLoop: RenderLoop? {
+        viewStateLock.lock()
+        defer { viewStateLock.unlock() }
+        return renderLoopStorage
+    }
+
+    /// True when frames are prepared and drawn on the render loop rather than
+    /// on the main thread.
+    ///
+    /// Only the layer surface can do this: `MTKView` draws from the view
+    /// system's display cycle, which is main-thread only (io-gaps.md G1, WO-F4).
+    var usesRenderLoop: Bool {
+        activeRenderLoop() != nil
+    }
+
+    /// Whether frames are being prepared and drawn on a render loop rather
+    /// than on the main thread.
+    ///
+    /// Public because a report that names the renderer must ask what actually
+    /// ran rather than re-derive it from the launch flags — the two drifted
+    /// apart the moment the default changed, and a mislabelled row is worse
+    /// than no row.
+    public var isUsingRenderLoop: Bool {
+        usesRenderLoop
+    }
+
+    func startRenderLoopIfNeeded () {
+        guard usesMetalLayerSurfaceSetting, metalView?.needsExternalDrawCall == true,
+              renderLoop == nil else {
+            return
+        }
+        let owner = renderOwner
+        let applyEffects: @MainActor @Sendable (MainFrameEffects) -> Void = { [weak self] effects in
+            self?.applyFrameSideEffects(effects)
+        }
+        let loop = RenderLoop {
+            guard let effects = owner.renderPublishedFrame() else { return }
+            Task { @MainActor in applyEffects(effects) }
+        }
+        viewStateLock.lock()
+        renderLoopStorage = loop
+        viewStateLock.unlock()
+        loop.start()
+    }
+
+    /// Runs `body` on the main thread with no frame in flight.
+    ///
+    /// Use it for anything structural: replacing the surface, tearing the
+    /// renderer down, drawing a frame synchronously. Must not be called while
+    /// holding the terminal lock — see `RenderLoop.frameLock`.
+    func withRenderLoopSuspended<T> (_ body: () -> T) -> T {
+        guard let renderLoop, renderLoop.isRunning else { return body() }
+        renderLoop.frameLock.lock()
+        defer { renderLoop.frameLock.unlock() }
+        return body()
+    }
+
+    func stopRenderLoop () {
+        viewStateLock.lock()
+        let loop = renderLoopStorage
+        renderLoopStorage = nil
+        viewStateLock.unlock()
+        loop?.invalidate()
+    }
+
+    /// The value `usesMetalLayerSurface` starts at. `SWIFTTERM_METAL_LAYER=0`
+    /// picks the `MTKView` surface at launch, the same way `--metal` picks the
+    /// renderer at launch — an initial value, not the switch itself.
+    static let defaultUsesMetalLayerSurface =
+        ProcessInfo.processInfo.environment["SWIFTTERM_METAL_LAYER"] != "0"
+
+    /// Whether the renderer draws into a `CAMetalLayer` this view owns, which
+    /// is what lets frames be prepared and drawn on a render loop instead of
+    /// the main thread (io-gaps.md G1).
+    ///
+    /// **On by default since WO-F5.** On the bidi flood the main-thread stall
+    /// p99 is 0.03–0.12 ms against 6.9–19.1 ms for `MTKView`, with throughput
+    /// and frame production unchanged.
+    ///
+    /// Settable at runtime, like ``setUseMetal(_:)``: setting it while Metal
+    /// is active rebuilds the surface in place, so a misbehaving frame can be
+    /// compared against the other surface without relaunching and losing
+    /// whatever provoked it.
+    public var usesMetalLayerSurface: Bool {
+        get { usesMetalLayerSurfaceSetting }
+        set { try? setUsesMetalLayerSurface(newValue) }
+    }
+
+    /// Selects the Metal surface, rebuilding it if Metal is already running.
+    ///
+    /// Throws for the same reasons ``setUseMetal(_:)`` does — the rebuild can
+    /// fail to create a device, renderer or shader library — in which case the
+    /// view falls back to Core Graphics rather than keeping a dead surface.
+    public func setUsesMetalLayerSurface(_ enabled: Bool) throws {
+        guard usesMetalLayerSurfaceSetting != enabled else { return }
+        usesMetalLayerSurfaceSetting = enabled
+        // Not running Metal: the choice applies the next time it starts.
+        guard useMetalRenderer else { return }
+        try updateMetalRenderer(enabled: false)
+        try updateMetalRenderer(enabled: true)
+    }
+
+    /// Connects a surface to its renderer.
+    ///
+    /// The two surfaces are driven differently, and this is the only place
+    /// that difference lives: `MTKView` calls its delegate from the view
+    /// system's display cycle, while the layer surface has no delegate and
+    /// asks us for a frame through a closure — which is what lets a render
+    /// loop take over in WO-F4.
+    func bindSurface(_ surface: any MetalRenderTarget) -> MetalMainActorDrawDelegate? {
+        if let mtkView = surface as? MTKView {
+            let delegate = MetalMainActorDrawDelegate(terminalView: self,
+                                                       renderOwner: renderOwner)
+            mtkView.delegate = delegate
+            return delegate
+        } else if let layerView = surface as? TerminalMetalLayerView {
+            let frameSignal = frameDriver.signal
+            layerView.onNeedsDisplay = {
+                // Marking dirty, not rendering: the surface asks for a frame
+                // from the layout pass, and the render loop is what turns
+                // that into a draw on the next tick.
+                frameSignal.markDirty()
+            }
+        }
+        return nil
+    }
+
+    func unbindSurface(_ surface: (any MetalRenderTarget)?) {
+        if let mtkView = surface as? MTKView {
+            mtkView.delegate = nil
+        } else if let layerView = surface as? TerminalMetalLayerView {
+            layerView.onNeedsDisplay = nil
+        }
+    }
+#endif
+
     func updateCursorPosition()
     {
         guard let viewState = captureFrameViewState() else { return }
@@ -4296,32 +4476,40 @@ extension TerminalView {
 
     func updateCursorPosition (from cursor: SnapshotCursor?, rowCount: Int)
     {
+        placeCaret(cursor.map { FrameCursorPlacement($0, rowCount: rowCount) })
+        if let cursor, cursor.screenRow >= 0, cursor.screenRow < rowCount {
+            caretView?.setText(cursor.renderData)
+        }
+    }
+
+    /// Moves the caret view to where a frame drew the cursor.
+    func placeCaret (_ placement: FrameCursorPlacement?)
+    {
         guard let caretView else { return }
-        guard let cursor, cursor.screenRow >= 0,
-              cursor.screenRow < rowCount else {
+        guard let placement, placement.screenRow >= 0,
+              placement.screenRow < placement.rowCount else {
             caretView.removeFromSuperview()
             return
         }
-        if !cursor.hidden && caretView.superview != self {
+        if !placement.hidden && caretView.superview != self {
             addSubview(caretView)
-        } else if cursor.hidden && caretView.superview == self {
+        } else if placement.hidden && caretView.superview == self {
             caretView.removeFromSuperview()
         }
-        let doublePosition = cursor.renderMode == .single ? 1.0 : 2.0
+        let doublePosition = placement.renderMode == .single ? 1.0 : 2.0
         #if os(iOS) || os(visionOS)
-        let offset = cellDimension.height * CGFloat(cursor.absoluteRow)
+        let offset = cellDimension.height * CGFloat(placement.absoluteRow)
         let lineOrigin = CGPoint(x: 0, y: offset)
         #else
-        let offset = cellDimension.height * CGFloat(cursor.screenRow + 1)
+        let offset = cellDimension.height * CGFloat(placement.screenRow + 1)
         let lineOrigin = CGPoint(x: 0, y: frame.height - offset)
         #endif
         caretView.frame.origin = CGPoint(
-            x: lineOrigin.x + cellDimension.width * doublePosition * CGFloat(cursor.visualCol),
+            x: lineOrigin.x + cellDimension.width * doublePosition * CGFloat(placement.visualCol),
             y: lineOrigin.y)
         caretView.frame.size.width = cellDimension.width * doublePosition *
-            CGFloat(cursor.columnWidth)
-        caretView.powerlineRenderMode = cursor.renderMode
-        caretView.setText(cursor.renderData)
+            CGFloat(placement.columnWidth)
+        caretView.powerlineRenderMode = placement.renderMode
     }
     
     /// Queues a frame without waiting for the next display-link callback.
@@ -4374,7 +4562,7 @@ extension TerminalView {
     /// each tick carried the 6 ms draw.
     func requestImmediateFrame ()
     {
-#if os(macOS) && canImport(MetalKit)
+#if canImport(MetalKit)
         // Not while nothing can see the terminal: signalling the loop bypasses
         // the display link, which is where the occlusion pause lives, so this
         // is the one path that could keep a render thread drawing into an
@@ -4519,8 +4707,6 @@ extension TerminalView {
             result.metalRowsRebuilt = counters.rowsRebuilt
             result.atlasInvalidationBuildAttempts = counters.atlasInvalidationBuildAttempts
         }
-#endif
-#if os(macOS) && canImport(MetalKit)
         if let loopCounters = renderLoop?.currentCounters {
             result.renderLoopFrames = loopCounters.frames
             result.renderLoopCoalesced = loopCounters.coalesced
@@ -4536,8 +4722,6 @@ extension TerminalView {
         frameDriver?.resetCounters()
 #if canImport(MetalKit)
         renderOwner.resetMetalCounters()
-#endif
-#if os(macOS) && canImport(MetalKit)
         renderLoop?.resetCounters()
 #endif
     }

@@ -332,25 +332,11 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     ///
     /// Assigned on main, but read from the parse thread as well, so every
     /// access goes through `viewStateLock` — see `activeRenderLoop()`.
-    private var renderLoopStorage: RenderLoop?
-
-    /// The running render loop, or nil. Safe from any thread.
-    func activeRenderLoop () -> RenderLoop? {
-        viewStateLock.lock()
-        let loop = renderLoopStorage
-        viewStateLock.unlock()
-        guard let loop, loop.isRunning else { return nil }
-        return loop
-    }
-
-    var renderLoop: RenderLoop? {
-        viewStateLock.lock()
-        defer { viewStateLock.unlock() }
-        return renderLoopStorage
-    }
+    var renderLoopStorage: RenderLoop?
+    var usesMetalLayerSurfaceSetting = TerminalView.defaultUsesMetalLayerSurface
     /// Experimental GPU path: CoreText glyph atlas + Metal quads.
     /// Limitations: image caching is basic; GPU path is still evolving.
-    private var useMetalRenderer = false
+    var useMetalRenderer = false
     /// The NSWindow that the current `metalView`'s CAMetalLayer is bound to.
     /// CAMetalLayer's binding to a window's WindowServer surface doesn't
     /// survive being reparented across NSWindow instances — `present(_:)`
@@ -413,64 +399,6 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             }
             renderOwner.discardPreparedMetalSnapshot()
         }
-    }
-
-    /// True when frames are prepared and drawn on the render loop rather than
-    /// on the main thread.
-    ///
-    /// Only the layer surface can do this: `MTKView` draws from AppKit's
-    /// display cycle, which is main-thread only (io-gaps.md G1, WO-F4).
-    var usesRenderLoop: Bool {
-        activeRenderLoop() != nil
-    }
-
-    /// Whether frames are being prepared and drawn on a render loop rather
-    /// than on the main thread.
-    ///
-    /// Public because a report that names the renderer must ask what actually
-    /// ran rather than re-derive it from the launch flags — the two drifted
-    /// apart the moment the default changed, and a mislabelled row is worse
-    /// than no row.
-    public var isUsingRenderLoop: Bool {
-        usesRenderLoop
-    }
-
-    func startRenderLoopIfNeeded () {
-        guard usesMetalLayerSurfaceSetting, metalView?.needsExternalDrawCall == true else {
-            return
-        }
-        let owner = renderOwner
-        let applyEffects: @MainActor @Sendable (MainFrameEffects) -> Void = { [weak self] effects in
-            self?.applyFrameSideEffects(effects)
-        }
-        let loop = RenderLoop {
-            guard let effects = owner.renderPublishedFrame() else { return }
-            Task { @MainActor in applyEffects(effects) }
-        }
-        viewStateLock.lock()
-        renderLoopStorage = loop
-        viewStateLock.unlock()
-        loop.start()
-    }
-
-    func stopRenderLoop () {
-        viewStateLock.lock()
-        let loop = renderLoopStorage
-        renderLoopStorage = nil
-        viewStateLock.unlock()
-        loop?.invalidate()
-    }
-
-    /// Runs `body` on the main thread with no frame in flight.
-    ///
-    /// Use it for anything structural: replacing the surface, tearing the
-    /// renderer down, drawing a frame synchronously. Must not be called while
-    /// holding the terminal lock — see `RenderLoop.frameLock`.
-    func withRenderLoopSuspended<T> (_ body: () -> T) -> T {
-        guard let renderLoop, renderLoop.isRunning else { return body() }
-        renderLoop.frameLock.lock()
-        defer { renderLoop.frameLock.unlock() }
-        return body()
     }
 
 #endif
@@ -649,7 +577,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
-    private func updateMetalRenderer(enabled: Bool) throws {
+    func updateMetalRenderer(enabled: Bool) throws {
         if enabled {
             if metalView != nil {
                 return
@@ -702,85 +630,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         max(1, metalScaleFactorOverride ?? backingScaleFactor())
     }
 
-    /// The value `usesMetalLayerSurface` starts at. `SWIFTTERM_METAL_LAYER=0`
-    /// picks the `MTKView` surface at launch, the same way `--metal` picks the
-    /// renderer at launch — an initial value, not the switch itself.
-    static let defaultUsesMetalLayerSurface =
-        ProcessInfo.processInfo.environment["SWIFTTERM_METAL_LAYER"] != "0"
-
-    /// Whether the renderer draws into a `CAMetalLayer` this view owns, which
-    /// is what lets frames be prepared and drawn on a render loop instead of
-    /// the main thread (io-gaps.md G1).
-    ///
-    /// **On by default since WO-F5.** On the bidi flood the main-thread stall
-    /// p99 is 0.03–0.12 ms against 6.9–19.1 ms for `MTKView`, with throughput
-    /// and frame production unchanged.
-    ///
-    /// Settable at runtime, like ``setUseMetal(_:)``: setting it while Metal
-    /// is active rebuilds the surface in place, so a misbehaving frame can be
-    /// compared against the other surface without relaunching and losing
-    /// whatever provoked it. `MTKView` remains the only surface on iOS.
-    public var usesMetalLayerSurface: Bool {
-        get { usesMetalLayerSurfaceSetting }
-        set { try? setUsesMetalLayerSurface(newValue) }
-    }
-
-    /// Selects the Metal surface, rebuilding it if Metal is already running.
-    ///
-    /// Throws for the same reasons ``setUseMetal(_:)`` does — the rebuild can
-    /// fail to create a device, renderer or shader library — in which case the
-    /// view falls back to Core Graphics rather than keeping a dead surface.
-    public func setUsesMetalLayerSurface(_ enabled: Bool) throws {
-        guard usesMetalLayerSurfaceSetting != enabled else { return }
-        usesMetalLayerSurfaceSetting = enabled
-        // Not running Metal: the choice applies the next time it starts.
-        guard useMetalRenderer else { return }
-        try updateMetalRenderer(enabled: false)
-        try updateMetalRenderer(enabled: true)
-    }
-
-    private var usesMetalLayerSurfaceSetting =
-        TerminalView.defaultUsesMetalLayerSurface
-
     /// Builds the Metal surface configured for terminal rendering. Used by both
     /// initial Metal enablement and `rebindMetalRendererToWindow` so the two
     /// paths can never drift out of sync on configuration.
-
-    /// Connects a surface to its renderer.
-    ///
-    /// The two surfaces are driven differently, and this is the only place
-    /// that difference lives: `MTKView` calls its delegate from AppKit's
-    /// display cycle, while the layer surface has no delegate and asks us for
-    /// a frame through a closure — which is what lets a render loop take over
-    /// in WO-F4.
-    private func bindSurface(_ surface: NSView & MetalRenderTarget)
-        -> MetalMainActorDrawDelegate?
-    {
-        if let mtkView = surface as? MTKView {
-            let delegate = MetalMainActorDrawDelegate(terminalView: self,
-                                                       renderOwner: renderOwner)
-            mtkView.delegate = delegate
-            return delegate
-        } else if let layerView = surface as? TerminalMetalLayerView {
-            let frameSignal = frameDriver.signal
-            layerView.onNeedsDisplay = {
-                // Marking dirty, not rendering: the surface asks for a frame
-                // from AppKit's layout pass, and the render loop is what turns
-                // that into a draw on the next tick.
-                frameSignal.markDirty()
-            }
-        }
-        return nil
-    }
-
-    private func unbindSurface(_ surface: (NSView & MetalRenderTarget)?) {
-        if let mtkView = surface as? MTKView {
-            mtkView.delegate = nil
-        } else if let layerView = surface as? TerminalMetalLayerView {
-            layerView.onNeedsDisplay = nil
-        }
-    }
-
     private func makeMetalView(frame: CGRect, device: MTLDevice) -> (NSView & MetalRenderTarget) {
         if usesMetalLayerSurfaceSetting {
             let layerView = TerminalMetalLayerView(frame: frame)
